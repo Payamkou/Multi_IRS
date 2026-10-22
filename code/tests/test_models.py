@@ -1,6 +1,7 @@
 """Spec §6.2 / §6.5: unfolded base class, FONR, shared feasibility and size tests."""
 import dataclasses
 import json
+import math
 import os
 
 import pytest
@@ -30,6 +31,8 @@ def _model(name):
     cfg = Config()
     if name == "fonr":
         return build_model("fonr", cfg, mu_init=MU0)
+    if name == "maso":
+        return build_model("maso", cfg, step_scale=1.0)
     return build_model(name, cfg)
 
 
@@ -172,7 +175,7 @@ def _capture_mlp_inputs(net):
 
 
 def test_maso_structure_and_param_count():
-    net = build_model("maso", Config())
+    net = build_model("maso", Config(), step_scale=1.0)
     assert isinstance(net, MASO) and net.L == 10 and net.N == 2 and net.M_train == 80
     assert len(net.psi) == 20
     n = sum(p.numel() for p in net.parameters() if p.requires_grad)
@@ -196,7 +199,7 @@ def test_complex_relu_and_linear():
 
 def test_maso_padding_small_M():
     torch.manual_seed(0)
-    net = MASO(L=1, N=2, M_train=80)
+    net = MASO(L=1, N=2, M_train=80, step_scale=1.0)
     ch, p0, phi0 = _make(3, 20, 6)
     p_new, aux = fp.deterministic_block(ch, p0, phi0)
     g = fp.grad_matrix_free(ch, p_new, phi0, aux)
@@ -216,7 +219,7 @@ def test_maso_padding_small_M():
 
 def test_maso_truncation_large_M():
     torch.manual_seed(0)
-    net = MASO(L=3, N=2, M_train=80)
+    net = MASO(L=3, N=2, M_train=80, step_scale=1.0)
     ch, p0, phi0 = _make(2, 160, 6)
     seen, hooks = _capture_mlp_inputs(net)
     with torch.no_grad():
@@ -236,7 +239,7 @@ def test_maso_truncation_large_M():
 
 
 def test_maso_K_agnostic_input():
-    net = MASO(L=1, N=2, M_train=80)
+    net = MASO(L=1, N=2, M_train=80, step_scale=1.0)
     for K in (6, 60):
         ch, p0, phi0 = _make(2, 80, K)
         seen, hooks = _capture_mlp_inputs(net)
@@ -250,7 +253,7 @@ def test_maso_K_agnostic_input():
 
 def test_maso_update_formula():
     torch.manual_seed(1)
-    net = MASO(L=1, N=2, M_train=80)
+    net = MASO(L=1, N=2, M_train=80, step_scale=1.0)
     ch, p0, phi0 = _make(2, 80, 6)
     p_new, aux = fp.deterministic_block(ch, p0, phi0)
     with torch.no_grad():
@@ -263,8 +266,55 @@ def test_maso_update_formula():
 
 
 def test_maso_grad_flows_complex64():
-    net = MASO(L=2, N=2, M_train=80)
+    net = MASO(L=2, N=2, M_train=80, step_scale=1.0)
     ch, p0, phi0 = _make(2, 80, 6, cdtype=torch.complex64)
     tr = net(ch, p0, phi0)
     fp.wsr(ch, tr.p[-1], tr.phi[-1]).mean().backward()
     assert net.psi[0][0].W_re.grad is not None and torch.isfinite(net.psi[0][0].W_re.grad).all()
+
+
+def test_maso_step_scale_buffer_and_scaling():
+    torch.manual_seed(2)
+    net = MASO(L=1, N=2, M_train=80, step_scale=3.5)
+    assert "step_scale" in dict(net.named_buffers()) and "step_scale" in net.state_dict()
+    assert all(p is not net.step_scale for p in net.parameters())
+    assert not net.step_scale.requires_grad
+    net2 = MASO(L=1, N=2, M_train=80, step_scale=1.0)
+    net2.load_state_dict(net.state_dict())
+    assert float(net2.step_scale) == 3.5
+    ch, p0, phi0 = _make(2, 20, 6)
+    p_new, aux = fp.deterministic_block(ch, p0, phi0)
+    g = fp.grad_matrix_free(ch, p_new, phi0, aux)
+    out = []
+    hooks = [m.register_forward_hook(lambda mod, a, o: out.append(o.detach())) for m in net.psi]
+    with torch.no_grad():
+        lam = net.step_sizes(0, phi0, g)
+    for h in hooks:
+        h.remove()
+    raw = torch.stack(out, dim=1)[..., :20]  # Softplus(Re Psi(z))
+    assert lam.dtype == F64 and torch.allclose(lam, 3.5 * raw.to(F64), rtol=1e-6)
+
+
+def test_build_model_maso_step_scale_from_fonr_mu(monkeypatch):
+    import models.fonr as mf
+    monkeypatch.setattr(mf, "fonr_mu_init", lambda cfg: 0.25)
+    net = build_model("maso", Config())
+    assert float(net.step_scale) == pytest.approx(2 * 0.25 / math.log(2))
+    assert float(build_model("maso", Config(), step_scale=7.0).step_scale) == 7.0
+
+
+def test_maso_degenerate_normalisation_keeps_phi():
+    # r is tangent (Re{r phi*} = 0) so |phi + lam r| >= 1 in exact arithmetic; the guard is defensive.
+    import models.maso as mm
+    _, _, phi0 = _make(2, 20, 6)
+    u = phi0.clone()
+    u[:, :, 3] = 0
+    out = mm._normalise_or_keep(u, phi0)
+    assert torch.equal(out[:, :, 3], phi0[:, :, 3])
+    assert torch.allclose(out.abs(), torch.ones_like(out.real))
+    phi32 = phi0.to(torch.complex64)
+    u32 = phi32.clone()
+    u32[:, :, 5] = 1e-39  # below float32 tiny
+    out32 = mm._normalise_or_keep(u32, phi32)
+    assert torch.equal(out32[:, :, 5], phi32[:, :, 5])
+    assert torch.isfinite(out32.real).all()

@@ -5,7 +5,10 @@ Per layer l and IRS n (after the deterministic block):
     r_n  = g_n - Re{g_n conj(phi_n)} phi_n               (Riemannian gradient)
     ghat = g_n / (||g_n|| + 1e-12)                      (norm over the FULL M)
     z_n  = [phi_n, ghat_n] padded with zeros / truncated to M_train each -> C^{2 M_train}
-    lam  = Softplus(Re Psi_{l,n}(z_n))[:M]   (zeros for elements >= M_train)
+    lam  = c * Softplus(Re Psi_{l,n}(z_n))[:M]   (zeros for elements >= M_train)
+           c = non-trainable buffer `step_scale`; build_model sets c = 2 mu0 / ln 2 with
+           mu0 = fonr_mu_init(cfg), so the untrained step c*Softplus(0) = 2 mu0 = 1/median(lambda_max)
+           matches the MM/FONR step scale
     phi_n <- (phi_n + lam r_n) / |phi_n + lam r_n|
 Elements beyond M_train are copied unchanged (exact), i.e. lambda = 0 there.
 
@@ -97,10 +100,21 @@ def _fit(x: torch.Tensor, Mt: int) -> torch.Tensor:
     return x[..., :Mt]
 
 
+def _normalise_or_keep(u: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+    """u/|u| where |u| > tiny, else the old phi (cf. ao.mm_phase_step). tiny = max(1e-300,
+    finfo(real dtype).tiny) so the guard is effective in float32 as well."""
+    tiny = max(1e-300, torch.finfo(u.real.dtype).tiny)
+    a = u.abs()
+    ok = a > tiny
+    return torch.where(ok, u / a.clamp_min(tiny), phi)
+
+
 class MASO(UnfoldedNet):
-    def __init__(self, L: int = 10, N: int = 2, M_train: int = 80):
+    def __init__(self, L: int = 10, N: int = 2, M_train: int = 80, step_scale: float = 1.0):
         super().__init__(L)
         self.N, self.M_train = int(N), int(M_train)
+        # non-trainable step scale c: lambda = c * Softplus(Re Psi(z)); saved in state_dict
+        self.register_buffer("step_scale", torch.tensor(float(step_scale)))
         self.psi = nn.ModuleList([_mlp(self.M_train) for _ in range(self.L * self.N)])
 
     def step_sizes(self, l: int, phi: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
@@ -109,6 +123,7 @@ class MASO(UnfoldedNet):
         ghat = g / (torch.linalg.vector_norm(g, dim=-1, keepdim=True) + 1e-12)
         z = torch.cat([_fit(phi, Mt), _fit(ghat, Mt)], dim=-1)  # (B,N,2Mt)
         lam = torch.stack([self.psi[l * self.N + n](z[:, n]) for n in range(self.N)], dim=1)
+        lam = self.step_scale.to(lam.dtype) * lam
         if M <= Mt:
             return lam[..., :M]
         return F.pad(lam, (0, M - Mt))
@@ -117,8 +132,7 @@ class MASO(UnfoldedNet):
         g = fp.grad_matrix_free(ch, p_new, phi, aux)
         r = g - (g * phi.conj()).real * phi
         lam = self.step_sizes(l, phi, g).to(phi.real.dtype)
-        u = phi + lam * r
-        out = u / u.abs()
+        out = _normalise_or_keep(phi + lam * r, phi)
         M, Mt = phi.shape[-1], self.M_train
         if M > Mt:  # lambda = 0 on the tail: keep those phases exactly
             out = torch.cat([out[..., :Mt], phi[..., Mt:]], dim=-1)
