@@ -7,6 +7,7 @@ import time
 import torch
 
 import ao
+import atomic
 import data
 import fp_core as fp
 from config import Config, config_hash
@@ -86,7 +87,7 @@ def build_teacher_labels(cfg: Config, splits=("train", "val", "test"), device=No
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     torch.save(blob, tmp)
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
     return path
 
 

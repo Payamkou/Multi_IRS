@@ -60,6 +60,7 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter
 
 import ao
+import atomic
 import data
 import fp_core as fp
 import plotting
@@ -92,7 +93,7 @@ def _load(npz):
 def _atomic_npz(path: str, **arrs) -> None:
     tmp = path + ".tmp.npz"
     np.savez(tmp, **arrs)
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
 
 
 def _write_csv(path, cols, rows):
@@ -101,7 +102,7 @@ def _write_csv(path, cols, rows):
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         w.writerows(rows)
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
 
 
 def _ci95(x: np.ndarray) -> np.ndarray:

@@ -375,3 +375,13 @@ def test_finished_run_without_best_raises(fresh_root):
     os.remove(best)
     with pytest.raises(RuntimeError, match="best.pt"):
         train.train_model("tias", cfg)
+
+
+def test_ao_cap_in_train_and_pilot_keys():
+    """The AO cap shapes the teacher labels, so it must invalidate pilots and checkpoints (I1)."""
+    from config import config_hash
+    for k in ("ao_tol", "ao_max_iter"):
+        assert k in train.TRAIN_KEYS and k in train.PILOT_KEYS
+    a, b = Config(ao_max_iter=100), dataclasses.replace(Config(), ao_max_iter=1000)
+    assert config_hash(a, train.TRAIN_KEYS) != config_hash(b, train.TRAIN_KEYS)
+    assert config_hash(a, train.PILOT_KEYS) != config_hash(b, train.PILOT_KEYS)

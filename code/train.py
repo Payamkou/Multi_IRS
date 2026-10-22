@@ -26,6 +26,7 @@ from pathlib import Path
 import torch
 
 import ao
+import atomic
 import data
 import fp_core as fp
 import teacher
@@ -70,8 +71,11 @@ def loss_deep_supervision(ch: ChannelBatch, traj: Trajectory, a: float = 0.5) ->
 
 
 # ================================================================ training loop (spec §8)
-TRAIN_KEYS = data.CHANNEL_KEYS + ("N", "M", "K", "L", "T", "n_train", "n_sup_epochs", "n_unsup_epochs", "batch_size",
-              "lr_grid", "loss_a", "maso_M_train", "tias_hidden", "grad_clip_norm")
+# ao_tol / ao_max_iter: the AO rule defines the teacher labels (Stage I targets), so changing the cap must
+# invalidate LR pilots and checkpoints too.
+TRAIN_KEYS = data.CHANNEL_KEYS + ("N", "M", "K", "L", "T", "ao_tol", "ao_max_iter", "n_train", "n_sup_epochs",
+                                  "n_unsup_epochs", "batch_size", "lr_grid", "loss_a", "maso_M_train", "tias_hidden",
+                                  "grad_clip_norm")
 PILOT_KEYS = TRAIN_KEYS + ("pilot_sup_epochs", "pilot_unsup_epochs")
 
 HISTORY_COLS = ["epoch", "stage", "lr", "train_loss", "val_loss", "train_wsr_mean", "train_wsr_std",
@@ -111,7 +115,7 @@ def _rdtype(cdtype):
 def _atomic_save(obj, path):
     tmp = path + ".tmp"
     torch.save(obj, tmp)
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
 
 
 def _write_csv(path, cols, rows):
@@ -121,7 +125,7 @@ def _write_csv(path, cols, rows):
         w.writeheader()
         for r in rows:
             w.writerow({c: r[c] for c in cols})
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
 
 
 def _read_csv(path):

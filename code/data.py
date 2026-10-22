@@ -5,6 +5,7 @@ import os
 
 import torch
 
+import atomic
 from channels import ChannelBatch, generate_channels
 from config import Config, config_hash, seed_for
 
@@ -46,5 +47,5 @@ def build_or_load(cfg: Config, split: str, point=None) -> dict:
             "theta0": theta0, "meta": meta}
     tmp = path + ".tmp"
     torch.save(blob, tmp)
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
     return {"ch": chb, "theta0": theta0, "meta": meta}

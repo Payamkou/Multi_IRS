@@ -39,6 +39,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
+import atomic
 from config import Config, config_hash
 
 CONFIRMED, PARTLY, CONTRADICTED, NOT_RUN = "Confirmed", "Partly confirmed", "Contradicted", "Not run"
@@ -1431,5 +1432,5 @@ def build_report(cfg: Config, summaries: Optional[dict] = None, out_path=None) -
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".md.tmp")
     tmp.write_text(md, encoding="utf-8")
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
     return path
