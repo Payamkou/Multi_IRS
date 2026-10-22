@@ -40,6 +40,7 @@ from typing import Callable, Optional
 import numpy as np
 
 import atomic
+import runlog
 from config import Config, config_hash
 
 CONFIRMED, PARTLY, CONTRADICTED, NOT_RUN = "Confirmed", "Partly confirmed", "Contradicted", "Not run"
@@ -1549,4 +1550,5 @@ def build_report(cfg: Config, summaries: Optional[dict] = None, out_path=None) -
     tmp = path.with_suffix(".md.tmp")
     tmp.write_text(md, encoding="utf-8")
     atomic.replace(tmp, path)
+    runlog.get_logger(cfg, "report").info("findings report written: %s (%d lines)", path, len(md.splitlines()))
     return path

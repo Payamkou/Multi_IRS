@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import time
 
 import torch
 
@@ -10,6 +9,7 @@ import ao
 import atomic
 import data
 import fp_core as fp
+import runlog
 from config import Config, config_hash
 
 REF_MAX_ITER = 1000
@@ -31,11 +31,12 @@ def build_all_datasets(cfg: Config) -> dict:
         out[s] = data._path(cfg, s, None)
     pts = {"sweep_M": sorted(set(cfg.sweep_M) | set(cfg.zeroshot_M)),
            "sweep_K": list(cfg.sweep_K), "sweep_power": list(cfg.sweep_crn_dbm)}
-    for s, ps in pts.items():
-        for p in ps:
-            data.build_or_load(cfg, s, p)
-            out[f"{s}_{int(p)}"] = data._path(cfg, s, p)
-            print(f"dataset {s} {p} ready", flush=True)
+    log = runlog.get_logger(cfg, "teacher")
+    todo = [(s, p) for s, ps in pts.items() for p in ps]
+    for s, p in runlog.bar(todo, desc="sweep datasets", unit="set"):
+        data.build_or_load(cfg, s, p)
+        out[f"{s}_{int(p)}"] = data._path(cfg, s, p)
+        log.info("dataset %s %s ready", s, p)
     return out
 
 
@@ -48,7 +49,9 @@ def _run_split(cfg, split, device, chunk, with_ref):
     def put(k, v):
         acc.setdefault(k, []).append(v.cpu())
 
-    for lo in range(0, B, chunk):
+    log = runlog.get_logger(cfg, "teacher")
+    pbar = runlog.bar(range(0, B, chunk), desc=f"teacher {split}", unit="chunk")
+    for lo in pbar:
         sl = slice(lo, min(lo + chunk, B))
         c = ch.slice(sl).to(device, torch.complex128)
         p0, phi0 = ao.init_state(c, theta0[sl].to(device))
@@ -64,8 +67,9 @@ def _run_split(cfg, split, device, chunk, with_ref):
             put("p_ref1000", rr.p)
             put("wsr_ref1000", fp.wsr(c, rr.p, rr.phi))
             put("n_iter_ref1000", rr.n_iter)
-        print(f"teacher {split} {sl.stop}/{B} meanWSR={float(acc['wsr_ao'][-1].mean()):.4f} "
-              f"t={time.strftime('%H:%M:%S')}", flush=True)
+        mw = float(acc["wsr_ao"][-1].mean())
+        pbar.set_postfix(meanWSR=f"{mw:.4f}")
+        log.info("teacher %s %d/%d meanWSR=%.4f", split, sl.stop, B, mw)
     return {k: torch.cat(v) for k, v in acc.items()}
 
 

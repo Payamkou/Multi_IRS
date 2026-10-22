@@ -84,6 +84,7 @@ from matplotlib.ticker import FuncFormatter
 import ao
 import data
 import plotting
+import runlog
 import timing
 import train
 from config import Config, config_hash, seed_for
@@ -134,7 +135,8 @@ def _sample_times(stepper, d, idx, cfg, device, cdtype) -> np.ndarray:
     On CUDA only, a sample whose step raises ``torch.linalg.LinAlgError`` (cuSOLVER eigvalsh in
     complex64 can fail on an ill-conditioned A_n in explicit AO) is recorded as NaN; on CPU it raises."""
     out = np.empty(len(idx))
-    for j, i in enumerate(idx):
+    desc = f"  {getattr(stepper, 'mode', type(stepper).__name__)} {torch.device(device).type}"
+    for j, i in enumerate(runlog.bar(idx, desc=desc, unit="sample", leave=False, mininterval=5.0)):
         try:
             out[j] = timing.time_steps(stepper, d["ch"].slice([int(i)]), d["theta0"][[int(i)]], cfg.L,
                                        device, cdtype, warmup=cfg.timing_warmup).mean()
@@ -171,7 +173,7 @@ def _cached_points(cfg, stem, labels, keys, files_of, extra, compute, force) -> 
     os.makedirs(os.path.join(cfg.root, "results", POINT_DIR), exist_ok=True)
     base = artifact_fingerprint(cfg)
     out = {}
-    for lab in labels:
+    for lab in runlog.bar(labels, desc=stem, unit="point"):
         p = point_path(cfg, stem, lab)
         fpr = extend_fingerprint(cfg, base, files_of(lab))
         if force or not check_cache(p, cfg, keys, fpr, extra):
@@ -227,9 +229,10 @@ def _runtime_point(cfg, split, x, tag, device, cdtype, nets: _Nets) -> dict:
         out[f"time_{n}_{tag}{x}"] = _sample_times(net, d, idx, cfg, device, cdtype)
     msg = ", ".join(f"{m} {1e3 * np.nanmean(out[f'time_{m}_{tag}{x}']):.4f}" for m in TIME_METHODS)
     nf = {m: int(np.isnan(out[f"time_{m}_{tag}{x}"]).sum()) for m in TIME_METHODS}
+    log = runlog.get_logger(cfg, "sweeps")
     if any(nf.values()):
-        print(f"[runtime {tag}={x}] WARNING samples failed (LinAlgError, recorded NaN): {nf}", flush=True)
-    print(f"[runtime {tag}={x} {device}/{_cname(cdtype)}] ms/iter: {msg}", flush=True)
+        log.warning("runtime %s=%s: samples failed (LinAlgError, recorded NaN): %s", tag, x, nf)
+    log.info("runtime %s=%s %s/%s ms/iter: %s", tag, x, device, _cname(cdtype), msg)
     out.update(point=np.int64(x), timing_idx=idx, timing_n_samples=np.int64(len(idx)),
                timing_threads=np.int64(torch.get_num_threads()))
     return out
@@ -248,7 +251,8 @@ def _wsr_arrays(cfg, split, points, tag, models, chunk: int = 250) -> dict:
     """Fresh efficient AO (cfg tol/max_iter, complex128) and layer-L net WSR per point."""
     out = {}
     dev = cfg.eval_device
-    for x in points:
+    log = runlog.get_logger(cfg, "sweeps")
+    for x in runlog.bar(points, desc=f"WSR sweep {split}", unit="point"):
         d = data.build_or_load(cfg, split, x)
         ch, theta0 = d["ch"], d["theta0"]
         w, it, w0 = [], [], []
@@ -266,7 +270,7 @@ def _wsr_arrays(cfg, split, points, tag, models, chunk: int = 250) -> dict:
         for n, m in models.items():
             out[f"wsr_{n}_{tag}{x}"] = _wsr_per_layer(m, ch, theta0, dev)[:, -1]
         msg = ", ".join(f"{m} {out[f'wsr_{m}_{tag}{x}'].mean():.4f}" for m in WSR_METHODS)
-        print(f"[wsr {tag}={x}] mean WSR: {msg}", flush=True)
+        log.info("wsr %s=%s mean WSR: %s", tag, x, msg)
     return out
 
 
@@ -531,15 +535,19 @@ def _gpu_steps_point(cfg, device, cdtype, nets) -> dict:
     idx = _timing_idx(cfg)
     d = data.build_or_load(cfg, "test")
     out = {}
+    log = runlog.get_logger(cfg, "gpu")
     for n in NETS:
         net = nets.on_device[n]
         out[f"step_time_{n}"] = np.stack([
             timing.time_steps(net, d["ch"].slice([int(i)]), d["theta0"][[int(i)]], net.L, device, cdtype,
-                              warmup=cfg.timing_warmup) for i in idx])
+                              warmup=cfg.timing_warmup)
+            for i in runlog.bar(idx, desc=f"  gpu steps {n}", unit="sample", leave=False, mininterval=5.0)])
+        log.info("gpu step timing %s: %.4f ms/layer", n, 1e3 * out[f"step_time_{n}"].mean())
     for mode in AO_MODES:
         st = ao.AOStepper(mode)
         runs = []
-        for i in idx:
+        for i in runlog.bar(idx, desc=f"  gpu AO {mode} to convergence", unit="sample", leave=False,
+                            mininterval=5.0):
             try:
                 runs.append(timing.time_until_converged(st, d["ch"].slice([int(i)]), d["theta0"][[int(i)]],
                                                         cfg.ao_tol, cfg.ao_max_iter, device, cdtype)[0])
@@ -549,9 +557,9 @@ def _gpu_steps_point(cfg, device, cdtype, nets) -> dict:
         out[f"ao_niter_{mode}"] = np.array([len(r) if np.isfinite(r).all() else -1 for r in runs])
         out[f"ao_steptime_{mode}"] = np.array([r.mean() for r in runs])
         nf = int(np.isnan(out[f"ao_cumtime_{mode}"]).sum())
-        print(f"[gpu timing] AO {mode} to convergence: {nf}/{len(idx)} samples failed "
-              f"({100 * nf / max(len(idx), 1):.1f} %, LinAlgError -> NaN)", flush=True)
-    print("[gpu timing] exp_01 step timings done", flush=True)
+        log.info(f"AO {mode} to convergence: {nf}/{len(idx)} samples failed "
+                 f"({100 * nf / max(len(idx), 1):.1f} %, LinAlgError -> NaN)")
+    log.info("exp_01 step timings done")
     return out
 
 
@@ -561,7 +569,7 @@ def run_gpu_timing(cfg: Config, force_rerun: bool = False):
     restored afterwards). Cached per point (``results/points/exp_supp_gpu_timing_{M<x>,K<x>,steps}.npz``),
     then combined into ``exp_supp_gpu_timing.npz`` / ``.csv``. No figure."""
     if not torch.cuda.is_available():
-        print("[gpu timing] CUDA not available; skipping the supplementary GPU timing", flush=True)
+        runlog.get_logger(cfg, "gpu").info("CUDA not available; skipping the supplementary GPU timing")
         return None, {"gpu_available": 0.0}
     device, cdtype = "cuda", C64
     _results_dir(cfg)
@@ -600,11 +608,11 @@ def run_gpu_timing(cfg: Config, force_rerun: bool = False):
         _gpu_csv(path[:-4] + ".csv", out, Ms, Ks)
         s = summarize(cfg, GPU_EXP, out)
         n_sweep = len(idx) * (len(Ms) + len(Ks))
-        print("[gpu timing] failures per AO mode: " + "; ".join(
+        runlog.get_logger(cfg, "gpu").info("failures per AO mode: " + "; ".join(
             f"{mode}: to convergence {int(s[f'ao_conv_n_failed_{mode}'])}/{len(idx)} "
             f"({s[f'ao_conv_pct_failed_{mode}']:.1f} %), sweeps "
             f"{int(sum(s[f'runtime_n_failed_ao_{mode}_{t}{x}'] for t, P in (('M', Ms), ('K', Ks)) for x in P))}"
-            f"/{n_sweep}" for mode in AO_MODES), flush=True)
+            f"/{n_sweep}" for mode in AO_MODES))
     return Path(path), summarize(cfg, GPU_EXP, _load(path))
 
 

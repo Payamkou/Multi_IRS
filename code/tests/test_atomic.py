@@ -34,9 +34,13 @@ def test_replace_gives_up_after_five_tries(tmp_path, monkeypatch):
 
 
 def test_all_writers_use_the_helper():
-    """No module calls os.replace directly any more."""
+    """No project module calls os.replace directly (atomic.py itself excepted); scans every code module."""
+    import glob
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for rel in ("train.py", "teacher.py", "data.py", "report.py", "experiments/convergence.py",
-                "experiments/sweeps.py"):
-        with open(os.path.join(here, rel), encoding="utf-8") as f:
-            assert "os.replace(" not in f.read(), rel
+    mods = [p for p in glob.glob(os.path.join(here, "**", "*.py"), recursive=True)
+            if os.sep + "tests" + os.sep not in p and os.path.basename(p) != "atomic.py"]
+    rels = {os.path.relpath(p, here).replace(os.sep, "/") for p in mods}
+    assert {"train.py", "teacher.py", "models/fonr.py", "experiments/sweeps.py"} <= rels
+    for p in mods:
+        with open(p, encoding="utf-8") as f:
+            assert "os.replace(" not in f.read(), os.path.relpath(p, here)

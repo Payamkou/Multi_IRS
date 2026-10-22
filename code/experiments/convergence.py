@@ -66,6 +66,7 @@ import atomic
 import data
 import fp_core as fp
 import plotting
+import runlog
 import teacher
 import timing
 import train
@@ -185,9 +186,10 @@ def run_convergence(cfg: Config, force_rerun: bool = False) -> Path:
     out["ao100_mean"] = np.float64(out["wsr_ao100"].mean())
     out["ao_baseline_max_iter"] = np.int64(cfg.ao_max_iter)
     out["ao1000_mean"] = np.float64(out["wsr_ao1000"].mean())
-    for n, m in models.items():
+    log = runlog.get_logger(cfg, "exp01")
+    for n, m in runlog.bar(list(models.items()), desc="exp01 WSR per layer", unit="model"):
         out[f"wsr_{n}"] = _wsr_per_layer(m, ch, theta0, cfg.eval_device)
-        print(f"[exp01] {n} WSR per layer: {np.round(out[f'wsr_{n}'].mean(0), 4)}", flush=True)
+        log.info("%s WSR per layer: %s", n, np.round(out[f"wsr_{n}"].mean(0), 4))
 
     idx = _timing_idx(cfg)
     prev = torch.get_num_threads()
@@ -195,14 +197,17 @@ def run_convergence(cfg: Config, force_rerun: bool = False) -> Path:
     try:
         for n, m in models.items():
             net = copy.deepcopy(m).to_precision(C128).to("cpu").eval()
+            # the bar advances between samples, never inside a timed step
             out[f"time_{n}"] = np.stack([
                 timing.time_steps(net, ch.slice([i]), theta0[[i]], net.L, "cpu", C128,
-                                  warmup=cfg.timing_warmup) for i in idx])
-            print(f"[exp01] {n} time/layer {1e3 * out[f'time_{n}'].mean():.4f} ms", flush=True)
+                                  warmup=cfg.timing_warmup)
+                for i in runlog.bar(idx, desc=f"exp01 timing {n}", unit="sample", leave=False)])
+            log.info("%s time/layer %.4f ms (%d samples)", n, 1e3 * out[f"time_{n}"].mean(), len(idx))
         for mode in AO_MODES:
             st = ao.AOStepper(mode)
             runs = [timing.time_until_converged(st, ch.slice([i]), theta0[[i]], cfg.ao_tol,
-                                                cfg.ao_max_iter, "cpu", C128) for i in idx]
+                                                cfg.ao_max_iter, "cpu", C128)
+                    for i in runlog.bar(idx, desc=f"exp01 timing AO {mode}", unit="sample", leave=False)]
             T = max(len(r[0]) for r in runs)
             cum = np.empty((len(idx), T + 1))
             wt = np.empty((len(idx), T + 1))
@@ -213,7 +218,7 @@ def run_convergence(cfg: Config, force_rerun: bool = False) -> Path:
             out[f"ao_cumtime_{mode}"] = cum
             out[f"ao_wsr_timed_{mode}"] = wt
             out[f"ao_niter_{mode}"] = np.array([len(r[0]) for r in runs])
-            print(f"[exp01] AO {mode} conv time {1e3 * cum[:, -1].mean():.3f} ms", flush=True)
+            log.info("AO %s conv time %.3f ms", mode, 1e3 * cum[:, -1].mean())
     finally:
         torch.set_num_threads(prev)
 

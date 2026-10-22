@@ -31,6 +31,7 @@ import ao
 import atomic
 import data
 import fp_core as fp
+import runlog
 import teacher
 from channels import ChannelBatch
 from config import Config, config_hash, seed_for
@@ -136,7 +137,7 @@ def _train_device(cfg: Config) -> str:
     dev = cfg.train_device
     if str(dev).startswith("cuda") and not torch.cuda.is_available():
         warnings.warn("CUDA unavailable: training falls back to CPU")
-        print("WARNING: CUDA unavailable, training on CPU", flush=True)
+        runlog.get_logger(cfg, "train").warning("CUDA unavailable, training on CPU")
         return "cpu"
     return dev
 
@@ -316,19 +317,26 @@ def run_lr_pilot(name: str, cfg: Config) -> float:
     D = _Data(cfg, device)
     n_sup, n_tot = cfg.pilot_sup_epochs, cfg.pilot_sup_epochs + cfg.pilot_unsup_epochs
     rows = []
+    log = runlog.get_logger(cfg, "train")
+    log.info("[pilot %s] lr grid %s, %d+%d epochs each, device %s", name, list(cfg.lr_grid), n_sup,
+             n_tot - n_sup, device)
     for lr in cfg.lr_grid:
         model = _fresh_model(name, cfg, device)
         opt = torch.optim.Adam(model.parameters(), lr=lr)
-        for ep in range(1, n_tot + 1):
+        pbar = runlog.bar(range(1, n_tot + 1), desc=f"pilot {name} lr={lr:g}", unit="epoch")
+        for ep in pbar:
             t0 = time.time()
             m = _train_epoch(model, opt, D, cfg, ep, n_sup)
             v = _val(model, D, cfg)
             st = _stage(ep, n_sup)
             rows.append({"lr": lr, "epoch": ep, "stage": st, "val_wsr_mean": v["wsr_mean"]})
-            print(f"[pilot {name} lr={lr:g}] epoch {ep}/{n_tot} {st} train_loss={m['train_loss']:.5g} "
-                  f"val_wsr={v['wsr_mean']:.4f} skipped={m['n_skipped_batches']} "
-                  f"t={time.time() - t0:.1f}s", flush=True)
+            pbar.set_postfix(loss=f"{m['train_loss']:.4g}", val_wsr=f"{v['wsr_mean']:.4f}",
+                             skipped=m["n_skipped_batches"])
+            log.info("[pilot %s lr=%g] epoch %d/%d %s train_loss=%.5g val_wsr=%.4f skipped=%d t=%.1fs",
+                     name, lr, ep, n_tot, st, m["train_loss"], v["wsr_mean"], m["n_skipped_batches"],
+                     time.time() - t0)
     choice = _pilot_choice(rows)
+    log.info("[pilot %s] selected lr %g", name, choice)
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump({"cfg_hash": h, "selected_lr": choice, "lr_grid": list(cfg.lr_grid)}, f, indent=2)
     _write_csv(path, PILOT_COLS, rows)  # written last: its existence marks a completed pilot
@@ -381,9 +389,14 @@ def train_model(name: str, cfg: Config, resume: bool = True, force_retrain: bool
             torch.cuda.set_rng_state_all(ck["rng_cuda"])
         start, best_wsr, best_epoch = ck["epoch"] + 1, ck["best_val_wsr"], ck["best_epoch"]
         mh = ck["metrics_history"]
-        print(f"[{name}] resuming at epoch {start}", flush=True)
-
-    for ep in range(start, n_tot + 1):
+    log = runlog.get_logger(cfg, "train")
+    if ck is not None:
+        log.info("[%s] resuming at epoch %d", name, start)
+    else:
+        log.info("[%s] training from scratch: lr %g, %d+%d epochs, device %s", name, lr, n_sup, n_tot - n_sup, device)
+    pbar = runlog.bar(range(start, n_tot + 1), desc=f"train {name}", unit="epoch", initial=start - 1,
+                      total=n_tot)
+    for ep in pbar:
         t0 = time.time()
         st = _stage(ep, n_sup)
         m = _train_epoch(model, opt, D, cfg, ep, n_sup)
@@ -408,17 +421,22 @@ def train_model(name: str, cfg: Config, resume: bool = True, force_retrain: bool
             _atomic_save(state, best_p)
         _atomic_save(state, last_p)
         _write_csv(hist_p, HISTORY_COLS, _history_rows(mh))
-        mark = " *" if is_best else ""
-        print(f"[{name}] epoch {ep}/{n_tot} {st} train_loss={m['train_loss']:.5g} "
-              f"val_wsr={v['wsr_mean']:.4f}{mark} skipped={m['n_skipped_batches']} "
-              f"t={row['epoch_time_sec']:.1f}s", flush=True)
+        pbar.set_postfix(loss=f"{m['train_loss']:.4g}", val_wsr=f"{v['wsr_mean']:.4f}",
+                         best=f"{best_wsr:.4f}@{best_epoch}", skipped=m["n_skipped_batches"])
+        log.info("[%s] epoch %d/%d %s train_loss=%.5g (R_nats=%.5g f_q=%.5g) val_loss=%.5g val_wsr=%.4f%s "
+                 "skipped=%d t=%.1fs", name, ep, n_tot, st, m["train_loss"], m["train_wsr_nats_term"],
+                 m["train_fq_term"], v["loss"], v["wsr_mean"], " *best" if is_best else "",
+                 m["n_skipped_batches"], row["epoch_time_sec"])
         if stop_after_epoch is not None and ep >= stop_after_epoch:
             break
+    pbar.close()
     if not os.path.exists(best_p):
         msg = f"{name}: no finite validation WSR so far; {best_p} (best.pt) not written"
         if mh["epoch"] and mh["epoch"][-1] >= n_tot:
             raise RuntimeError(msg)
         warnings.warn(msg)
+    else:
+        log.info("[%s] best epoch %d, val WSR %.4f (%s)", name, best_epoch, best_wsr, best_p)
     return Path(best_p)
 
 

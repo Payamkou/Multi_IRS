@@ -13,6 +13,7 @@ import os
 import torch
 from torch import nn
 
+import atomic
 import fp_core as fp
 from ao import init_state, lambda_max
 from config import config_hash
@@ -138,7 +139,7 @@ def _mu_entry(cfg, chunk: int = 1000) -> dict:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cache, f, indent=2)
-    os.replace(tmp, path)
+    atomic.replace(tmp, path)
     return entry
 
 
