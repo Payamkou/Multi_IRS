@@ -6,13 +6,14 @@ Per layer l (after the deterministic block, which gives p_new and aux from the l
      x_{n,k} = 1, sum-pooled to u1 = g_n[m] (Wirtinger gradient) and u2 = [A_n]_mm.
   3. node update, ONE MLP shared by all N*M nodes and all L layers:
         s     = Softplus(F_GNN(features))                       (B,N,M) >= 0
-        Delta = s * u1 / (u2 + delta),   delta = 1e-12 * max_{n,m} u2  per sample
+        Delta = s * u1 / (u2 + delta),   delta = 1e-12 * max_{n,m} u2  per sample (Delta := 0 where u2 = 0)
         phi  <- (phi + Delta) / |phi + Delta|
      Nodes on an IRS with no users have u1 = u2 = 0 -> Delta = 0; phi is copied there exactly.
 
 Scale-free node features (eps = 1e-12):
   f1 = Re{u1 phi*}/(|u1|+eps), f2 = Im{u1 phi*}/(|u1|+eps),
-  f3 = log(|u1|/(u2+eps) + eps) standardised per sample (population std, clamped >= 1e-12),
+  f3 = log(|u1|/(u2+eps) + eps) standardised per sample (population std, clamped >= 1e-12;
+       mean/std are detached constants for backprop),
   f4 = K_n / K.
 Builder's choice (recorded): the f3 mean/std run over the sample's nodes that HAVE users
 (K_n > 0) and f3 = 0 at user-less nodes. When every IRS has users this is exactly the spec's
@@ -60,9 +61,12 @@ def tias_features(ch, u1: torch.Tensor, u2: torch.Tensor, phi: torch.Tensor) -> 
     deg = ch.x.to(rd).sum(-1)                                            # (B,N) K_n
     act = (deg > 0).unsqueeze(-1).expand_as(raw).to(rd)                  # nodes with users
     cnt = act.sum((-2, -1), keepdim=True).clamp_min(1.0)
-    mean = (raw * act).sum((-2, -1), keepdim=True) / cnt
-    var = (((raw - mean) * act) ** 2).sum((-2, -1), keepdim=True) / cnt
-    std = var.sqrt().clamp_min(STD_MIN)
+    # statistics are detached (no gradient through mean/std) and the variance is floored
+    # BEFORE sqrt: sqrt'(0) = inf gave NaN when all active nodes sit at the f3 floor.
+    rd_ = raw.detach()
+    mean = (rd_ * act).sum((-2, -1), keepdim=True) / cnt
+    var = (((rd_ - mean) * act) ** 2).sum((-2, -1), keepdim=True) / cnt
+    std = var.clamp_min(STD_MIN ** 2).sqrt()
     f3 = torch.where(act > 0, (raw - mean) / std, torch.zeros_like(raw))
     f4 = (deg / ch.K).unsqueeze(-1).expand_as(raw)
     return torch.stack([f1, f2, f3, f4], dim=-1)
@@ -89,8 +93,12 @@ class TIAS(UnfoldedNet):
     def phase_update(self, l, ch, p_new, phi, aux):
         u1, u2 = tias_messages(ch, p_new, phi, aux)
         s = self.node_scale(tias_features(ch, u1, u2, phi))
-        tiny = max(1e-300, torch.finfo(u2.dtype).tiny)
-        delta = (DELTA_REL * u2.amax(dim=(-2, -1), keepdim=True)).clamp_min(tiny)
-        out = _normalise_or_keep(phi + s * u1 / (u2 + delta), phi)
+        delta = DELTA_REL * u2.amax(dim=(-2, -1), keepdim=True)
+        # double-where: Delta only where u2 > 0, with a safe denominator (1) elsewhere, so no
+        # s/delta-with-delta-at-its-floor appears in backward for user-less nodes or samples
+        pos = u2 > 0
+        den = torch.where(pos, u2 + delta, torch.ones_like(u2))
+        step = torch.where(pos, s * u1 / den, torch.zeros_like(u1))
+        out = _normalise_or_keep(phi + step, phi)
         has_users = (ch.x.sum(-1) > 0).unsqueeze(-1)                     # (B,N,1)
         return torch.where(has_users, out, phi)

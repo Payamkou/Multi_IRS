@@ -446,3 +446,48 @@ def test_tias_grad_flows_complex64():
     fp.wsr(ch, tr.p[-1], tr.phi[-1]).mean().backward()
     w = net.mlp[0].weight
     assert w.dtype == torch.float32 and w.grad is not None and torch.isfinite(w.grad).all()
+
+
+@pytest.mark.parametrize("cdtype", [C128, torch.complex64])
+def test_tias_grads_finite_when_u1_zero_on_active_irs(cdtype, monkeypatch):
+    # all active nodes at the f3 floor (u1 == 0) -> per-sample var == 0
+    ch, p0, phi0 = _tias_graph_case()
+    ch = ch.to("cpu", cdtype)
+    phi = phi0.to(cdtype).clone().requires_grad_(True)
+    u1 = torch.zeros(phi.shape, dtype=cdtype, requires_grad=True)
+    u2 = (torch.rand(phi.shape, dtype=ch.P.dtype) + 0.1) * ch.x.sum(-1, keepdim=True).gt(0)
+    u2.requires_grad_(True)
+    f = tias_features(ch, u1, u2, phi)
+    assert torch.isfinite(f).all()
+    f.pow(2).sum().backward()
+    for t in (u1, u2, phi):
+        g = torch.view_as_real(t.grad.resolve_conj()) if t.grad.is_complex() else t.grad
+        assert torch.isfinite(g).all()
+    # one TIAS layer with c_k == 0 for every user: u1 == 0 exactly, u2 > 0 on the active IRS
+    import models.tias as mt
+    real_obs = fp.obs_scalar
+    monkeypatch.setattr(mt.fp, "obs_scalar", lambda *a: 0.0 * real_obs(*a))
+    net = TIAS(L=1)
+    phi_in = phi0.to(cdtype).clone().requires_grad_(True)
+    p_new, aux = fp.deterministic_block(ch, ch.P, phi_in)
+    u1c, u2c = tias_messages(ch, p_new, phi_in, aux)
+    assert torch.all(u1c == 0) and torch.all(u2c[:, 1] > 0)
+    out = net.phase_update(0, ch, p_new, phi_in, aux)
+    fp.wsr(ch, p_new, out).sum().backward()
+    assert torch.isfinite(phi_in.grad.real).all() and torch.isfinite(phi_in.grad.imag).all()
+    for prm in net.parameters():
+        assert prm.grad is not None and torch.isfinite(prm.grad).all()
+
+
+@pytest.mark.parametrize("cdtype", [C128, torch.complex64])
+def test_tias_grads_finite_all_empty_sample(cdtype):
+    ch, p0, phi0 = _make(2, 20, 6, cdtype=cdtype)
+    x = ch.x.clone()
+    x[0] = 0.0  # sample 0: no user has any IRS link -> u2 == 0 everywhere, delta at its floor
+    ch = ChannelBatch(ch.hd, ch.b, x, ch.w, ch.P, ch.sigma2)
+    net = TIAS(L=2)
+    tr = net(ch, p0, phi0)
+    assert torch.equal(tr.phi[-1][0], phi0[0])
+    fp.wsr(ch, tr.p[-1], tr.phi[-1]).sum().backward()
+    for prm in net.parameters():
+        assert prm.grad is not None and torch.isfinite(prm.grad).all()
