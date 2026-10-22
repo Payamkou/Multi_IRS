@@ -285,7 +285,18 @@ def test_nan_error_and_not_run_verdicts():
     # ...except where NaN is a real outcome: "never reached 98%" is Contradicted
     _, v, _ = report.evaluate_claim(_claim(claims, "wall_tias_98pct_085ms"),
                                     {"convergence": {"time_to_98pct_tias_ms": float("nan")}})
-    assert v == report.CONTRADICTED
+    assert v == report.NEVER_REACHED == "Contradicted (never reached)"
+    _, v, _ = report.evaluate_claim(_claim(claims, "wall_tias_99pct_1ms"),
+                                    {"convergence": {"time_to_99pct_tias_ms": float("nan")}})
+    assert v == report.NEVER_REACHED
+    # two-key time claim: NaN from the AO input is Not run; NaN target with a valid AO input is never reached
+    c = _claim(claims, "wall_tias98_within_first_ao_iter_explicit")
+    (s1, n1), (s2, n2) = [k.split(":", 1) for k in c.measured_key]
+    nan = float("nan")
+    assert report.evaluate_claim(c, {s1: {n1: 1.0}, s2: {n2: nan}})[1] == report.NOT_RUN
+    S = {s1: {n1: nan}}
+    S.setdefault(s2, {})[n2] = 1.0
+    assert report.evaluate_claim(c, S)[1] == report.NEVER_REACHED
     # an exception inside verdict_fn is reported as an error, never as Contradicted
     c = _claim(claims, "rtM_maso_approx_fonr")
     S = {"runtime_M": {k.split(":", 1)[1]: 0.0 for k in c.measured_key}}

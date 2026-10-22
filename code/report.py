@@ -42,6 +42,7 @@ import numpy as np
 from config import Config, config_hash
 
 CONFIRMED, PARTLY, CONTRADICTED, NOT_RUN = "Confirmed", "Partly confirmed", "Contradicted", "Not run"
+NEVER_REACHED = "Contradicted (never reached)"
 NETS = ("fonr", "maso", "tias")
 NET = {"fonr": "FONR", "maso": "MASO", "tias": "TIAS"}
 AO_MODES = ("explicit", "efficient")
@@ -87,6 +88,7 @@ class Claim:
     text_section: str = "VI"      # main.tex section the suggested edit goes to
     tag_fn: Optional[Callable[[dict], str]] = None  # direction tag for approximate claims
     nan_ok: bool = False          # True: NaN is a real outcome (e.g. "never reached"), not a missing input
+    never_key: str = ""           # with nan_ok: NaN in this key = target never reached; NaN elsewhere = Not run
 
 
 def _nan(v) -> bool:
@@ -273,7 +275,7 @@ def make_claims(cfg: Config) -> list:
     k98, k99 = cv("time_to_98pct_tias_ms"), cv("time_to_99pct_tias_ms")
     add(id="wall_tias_98pct_085ms", section="VI-B", figure="Fig. 2",
         text="TIAS reaches ≈98% of AO's converged WSR within ≈0.85 ms", measured_key=(k98,),
-        verdict_fn=_v_time_within(k98, 0.85), nan_ok=True, tag_fn=_tag_point(k98, 0.85),
+        verdict_fn=_v_time_within(k98, 0.85), nan_ok=True, never_key=k98, tag_fn=_tag_point(k98, 0.85),
         tolerance="mean cumulative CPU time at the first layer with mean WSR ≥ 0.98·AO mean: Confirmed if "
                   "≤ 1.5·0.85 ms; Partly if ≤ 3·0.85 ms; never reached → Contradicted",
         suggestion="Sec. VI-B: replace '≈0.85 ms' by the measured time to 98% ({m} ms; NaN = never reached at "
@@ -288,14 +290,14 @@ def make_claims(cfg: Config) -> list:
             return CONFIRMED if t <= a else PARTLY if t <= 2 * a else CONTRADICTED
         add(id=f"wall_tias98_within_first_ao_iter_{mode}", section="VI-B", figure="Fig. 2",
             text=f"TIAS's 98% time is within the budget AO ({mode}) needs to complete its first phase-shift update",
-            measured_key=(k98, ka), verdict_fn=first, nan_ok=True,
+            measured_key=(k98, ka), verdict_fn=first, nan_ok=True, never_key=k98,
             tolerance=f"AO first-update time taken as the mean per-iteration time of the first L iterations at "
                       f"M = {M0} (Fig. 4 data); Confirmed if t98(TIAS) ≤ t_iter(AO); Partly if ≤ 2·t_iter",
             suggestion=f"Sec. VI-B: compare TIAS's time to 98% with the measured AO ({mode}) per-iteration time "
                        "({m}).")
     add(id="wall_tias_99pct_1ms", section="VI-B", figure="Fig. 2",
         text="TIAS crosses 99% of AO's converged WSR by ≈1 ms", measured_key=(k99,),
-        verdict_fn=_v_time_within(k99, 1.0), nan_ok=True, tag_fn=_tag_point(k99, 1.0),
+        verdict_fn=_v_time_within(k99, 1.0), nan_ok=True, never_key=k99, tag_fn=_tag_point(k99, 1.0),
         tolerance="Confirmed if ≤ 1.5 ms; Partly if ≤ 3 ms; never reached → Contradicted",
         suggestion="Sec. VI-B: replace '≈1 ms' by the measured time to 99% ({m} ms; NaN = never reached at L = 10).")
     for mode in AO_MODES:
@@ -309,7 +311,7 @@ def make_claims(cfg: Config) -> list:
             return CONFIRMED if r >= 5 else PARTLY if r > 1 else CONTRADICTED
         add(id=f"wall_tias99_order_before_ao_{mode}", section="VI-B", figure="Fig. 2",
             text=f"TIAS crosses 99% nearly an order of magnitude before AO ({mode}) converges",
-            measured_key=(k99, kc), verdict_fn=order, nan_ok=True,
+            measured_key=(k99, kc), verdict_fn=order, nan_ok=True, never_key=k99,
             tolerance="ratio t_conv(AO)/t99(TIAS): 'nearly an order of magnitude' → Confirmed if ≥ 5; Partly if > 1",
             suggestion=f"Sec. VI-B: state the measured ratio of AO ({mode}) convergence time to TIAS's 99% time "
                        "({m}).")
@@ -618,6 +620,10 @@ def evaluate_claim(claim: Claim, S: dict) -> tuple:
     m = measure(claim, S)
     if m is None or (not claim.nan_ok and _has_nan(m)):
         return m, NOT_RUN, ""
+    if claim.nan_ok and claim.never_key and _has_nan(m):
+        if _has_nan({k: v for k, v in m.items() if k != claim.never_key}):
+            return m, NOT_RUN, ""         # NaN from a missing (e.g. AO) input: cannot judge
+        return m, NEVER_REACHED, ""       # the target was never reached
     try:
         v = claim.verdict_fn(m)
     except Exception as e:  # noqa: BLE001 - reported, not hidden
@@ -1179,7 +1185,7 @@ def _section_claims(cfg, S, ao) -> tuple:
     rows, results, counts = [], [], {CONFIRMED: 0, PARTLY: 0, CONTRADICTED: 0, NOT_RUN: 0, "Error": 0}
     for c in claims:
         m, v, tag = evaluate_claim(c, S)
-        counts[v if v in counts else "Error"] += 1
+        counts[CONTRADICTED if v == NEVER_REACHED else v if v in counts else "Error"] += 1
         note = ""
         if c.note_key and ao != "AO-1000":
             nm = {}
@@ -1375,7 +1381,7 @@ def _section_suggestions(results, ao) -> list:
         out += [f"### Sec. {sec}", ""]
         items = []
         for c, m, v, tag in results:
-            if c.text_section == sec and v in (CONTRADICTED, PARTLY):
+            if c.text_section == sec and v in (CONTRADICTED, NEVER_REACHED, PARTLY):
                 vt = v + (f", {tag}" if tag else "")
                 items.append(f"- [`{c.id}`, {vt}] {c.figure}: \"{c.text}\" — measured {_fmt_measured(m)}. "
                              f"Suggested: {c.suggestion.format(m=_fmt_measured(m, 4), ao=ao)}")
