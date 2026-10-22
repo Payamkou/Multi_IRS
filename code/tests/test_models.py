@@ -572,3 +572,11 @@ def test_fonr_complex64_grads_finite_with_zero_power_user():
     loss.backward()
     assert net.mu.grad is not None and torch.isfinite(net.mu.grad).all()
     assert net.mu.grad.abs().sum() > 0
+
+
+def test_fonr_mu_probe_does_not_touch_global_rng(tmp_path):
+    torch.manual_seed(12345)
+    want = torch.rand(3)
+    torch.manual_seed(12345)
+    fonr_mu_init(_mu_cfg(tmp_path))
+    assert torch.equal(torch.rand(3), want)

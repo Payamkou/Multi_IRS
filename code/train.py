@@ -205,8 +205,9 @@ def _optimizer_step(model, opt, loss: torch.Tensor, max_norm: float) -> bool:
 
 def _train_epoch(model, opt, D: _Data, cfg: Config, epoch: int, n_sup: int) -> dict:
     """One epoch; epochs 1..n_sup supervised, later deep-supervised Stage II.
-    train_* are means over the epoch's batches (train_wsr_std = mean of per-batch stds);
-    n_skipped_batches counts batches whose step was skipped for non-finite loss/gradients."""
+    train_* are means over the epoch's NON-skipped batches (train_wsr_std = mean of per-batch
+    stds); NaN if every batch was skipped. n_skipped_batches counts batches whose step was
+    skipped for non-finite loss/gradients."""
     model.train()
     gen = torch.Generator().manual_seed(seed_for("train") + epoch)
     perm = torch.randperm(D.B, generator=gen)
@@ -219,15 +220,19 @@ def _train_epoch(model, opt, D: _Data, cfg: Config, epoch: int, n_sup: int) -> d
             loss = loss_supervised(tr.phi[-1], D.phi_star[idx])
         else:
             loss = loss_deep_supervision(c, tr, cfg.loss_a)
-        n_skip += _optimizer_step(model, opt, loss, cfg.grad_clip_norm)
+        skipped = _optimizer_step(model, opt, loss, cfg.grad_clip_norm)
+        n_skip += skipped
+        if skipped:
+            continue
         with torch.no_grad():
             w = fp.wsr(c, tr.p[-1].detach(), tr.phi[-1].detach())
         losses.append(loss.item())
         means.append(float(w.mean()))
         stds.append(float(w.std()) if w.numel() > 1 else 0.0)
     nb = len(losses)
-    return {"train_loss": sum(losses) / nb, "train_wsr_mean": sum(means) / nb,
-            "train_wsr_std": sum(stds) / nb, "n_skipped_batches": int(n_skip)}
+    avg = (lambda v: sum(v) / nb) if nb else (lambda v: float("nan"))
+    return {"train_loss": avg(losses), "train_wsr_mean": avg(means),
+            "train_wsr_std": avg(stds), "n_skipped_batches": int(n_skip)}
 
 
 def _val(model, D: _Data, cfg: Config) -> dict:
@@ -259,10 +264,12 @@ def run_lr_pilot(name: str, cfg: Config) -> float:
     meta_path = os.path.join(logs, f"{name}_lr_pilot.json")
     h = config_hash(cfg, PILOT_KEYS)
     if os.path.exists(path):
-        if os.path.exists(meta_path):
-            with open(meta_path, encoding="utf-8") as f:
-                if json.load(f).get("cfg_hash") != h:
-                    raise ValueError("config mismatch")
+        if not os.path.exists(meta_path):
+            raise ValueError(f"{path} exists without its sidecar {meta_path}; cannot verify the config "
+                             "(delete the CSV to rerun the pilot)")
+        with open(meta_path, encoding="utf-8") as f:
+            if json.load(f).get("cfg_hash") != h:
+                raise ValueError("config mismatch")
         return _pilot_choice(_read_csv(path))
     device = _train_device(cfg)
     D = _Data(cfg, device)
@@ -309,6 +316,9 @@ def train_model(name: str, cfg: Config, resume: bool = True, force_retrain: bool
         if ck["cfg_hash"] != h:
             raise ValueError("config mismatch")
         if ck["epoch"] >= n_tot:
+            if not os.path.exists(best_p):
+                raise RuntimeError(f"{name}: training finished but {best_p} (best.pt) is missing "
+                                   "(no finite validation WSR, or file deleted); use force_retrain=True")
             return Path(best_p)
 
     device = _train_device(cfg)
@@ -364,7 +374,10 @@ def train_model(name: str, cfg: Config, resume: bool = True, force_retrain: bool
         if stop_after_epoch is not None and ep >= stop_after_epoch:
             break
     if not os.path.exists(best_p):
-        warnings.warn(f"{name}: no finite validation WSR so far; {best_p} not written")
+        msg = f"{name}: no finite validation WSR so far; {best_p} (best.pt) not written"
+        if mh["epoch"] and mh["epoch"][-1] >= n_tot:
+            raise RuntimeError(msg)
+        warnings.warn(msg)
     return Path(best_p)
 
 

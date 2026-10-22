@@ -336,3 +336,42 @@ def test_fonr_tiny_training_finite_with_best(fresh_root):
     last = torch.load(os.path.join(cfg.root, "checkpoints", "fonr_last.pt"), weights_only=False)
     assert all(torch.isfinite(v).all() for v in last["model_state"].values())
     assert last["metrics_history"]["n_skipped_batches"] == [int(r["n_skipped_batches"]) for r in rows]
+
+
+def test_epoch_means_exclude_skipped_batches(fresh_root, monkeypatch):
+    cfg = _tiny_cfg(fresh_root("l"))
+    D = train._Data(cfg, "cpu")
+    net = train._fresh_model("tias", cfg, "cpu")
+    opt = torch.optim.Adam(net.parameters(), lr=0.01)
+    real = train.loss_supervised
+    calls = []
+
+    def first_nan(a, b):
+        calls.append(1)
+        out = real(a, b)
+        return out * float("nan") if len(calls) == 1 else out
+
+    monkeypatch.setattr(train, "loss_supervised", first_nan)
+    m = train._train_epoch(net, opt, D, cfg, 1, cfg.n_sup_epochs)
+    assert m["n_skipped_batches"] == 1
+    assert math.isfinite(m["train_loss"]) and math.isfinite(m["train_wsr_mean"])
+    assert math.isfinite(m["train_wsr_std"])
+    monkeypatch.setattr(train, "loss_supervised", lambda a, b: real(a, b) * float("nan"))
+    m = train._train_epoch(net, opt, D, cfg, 1, cfg.n_sup_epochs)
+    assert m["n_skipped_batches"] == 2 and math.isnan(m["train_loss"]) and math.isnan(m["train_wsr_mean"])
+
+
+def test_pilot_csv_without_sidecar_refused(fresh_root):
+    cfg = _tiny_cfg(fresh_root("m"))
+    train.run_lr_pilot("tias", cfg)
+    os.remove(os.path.join(cfg.root, "logs", "tias_lr_pilot.json"))
+    with pytest.raises(ValueError, match="sidecar"):
+        train.run_lr_pilot("tias", cfg)
+
+
+def test_finished_run_without_best_raises(fresh_root):
+    cfg = _tiny_cfg(fresh_root("n"))
+    best = train.train_model("tias", cfg)
+    os.remove(best)
+    with pytest.raises(RuntimeError, match="best.pt"):
+        train.train_model("tias", cfg)

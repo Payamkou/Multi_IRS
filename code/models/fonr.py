@@ -62,18 +62,21 @@ def _probe_q(cfg, mu0: float, batches) -> tuple:
     from config import seed_for
     from train import loss_deep_supervision  # lazy: train imports models
     dev = batches[0][0].b.device
-    torch.manual_seed(seed_for("model_init"))
-    net = FONR(L=cfg.L, T=cfg.T, mu_init=mu0).to(dev)
-    finite, gmax = True, 0.0
-    for ch, p0, phi0 in batches:
-        net.zero_grad(set_to_none=True)
-        loss = loss_deep_supervision(ch, net(ch, p0, phi0), cfg.loss_a)
-        loss.backward()
-        g = net.mu.grad
-        ok = bool(torch.isfinite(loss.detach())) and g is not None and bool(torch.isfinite(g).all())
-        finite = finite and ok
-        if g is not None:  # NaN-propagating max (Python max() would drop a NaN)
-            gmax = float(torch.maximum(torch.tensor(gmax), g.detach().abs().max().double().cpu()))
+    cuda_devs = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    # manual_seed reseeds CPU and every CUDA device: fork them all so the probe has no side effect
+    with torch.random.fork_rng(devices=cuda_devs):
+        torch.manual_seed(seed_for("model_init"))
+        net = FONR(L=cfg.L, T=cfg.T, mu_init=mu0).to(dev)
+        finite, gmax = True, 0.0
+        for ch, p0, phi0 in batches:
+            net.zero_grad(set_to_none=True)
+            loss = loss_deep_supervision(ch, net(ch, p0, phi0), cfg.loss_a)
+            loss.backward()
+            g = net.mu.grad
+            ok = bool(torch.isfinite(loss.detach())) and g is not None and bool(torch.isfinite(g).all())
+            finite = finite and ok
+            if g is not None:  # NaN-propagating max (Python max() would drop a NaN)
+                gmax = float(torch.maximum(torch.tensor(gmax), g.detach().abs().max().double().cpu()))
     return finite, gmax
 
 
