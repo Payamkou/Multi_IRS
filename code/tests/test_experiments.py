@@ -226,3 +226,158 @@ def test_summary_ao_baseline_max_iter(env):
     p = run_convergence(env)
     assert int(np.load(p)["ao_baseline_max_iter"]) == env.ao_max_iter
     assert summarize_convergence(p)["ao_baseline_max_iter"] == float(env.ao_max_iter)
+
+
+# ================================================================ Task 13: sweeps (Figs. 4-8)
+SWEEP_FIGS = {"runtime_vs_M": "avg_time_vs_Number_of_RIS_M", "power": "etha_vs_CRN_transmit_power",
+              "wsr_vs_K": "WSR_vs_Number_of_active_users_K", "runtime_vs_K": "avg_time_vs_Number_of_active_users_K",
+              "zeroshot": "WSR_vs_M_ZeroShot"}
+
+
+@pytest.fixture(scope="module")
+def sweep_env(tmp_path_factory):
+    root = tmp_path_factory.mktemp("sweep_root")
+    paper = tmp_path_factory.mktemp("sweep_paper")
+    # training M = 80 (so MASO pads at M=20 and truncates at M=100); 80 deliberately NOT in zeroshot_M
+    cfg = _tiny_cfg(root, paper, n_test=4, M=80, K=3, sweep_M=(20, 40), sweep_K=(3, 4),
+                    sweep_crn_dbm=(20, 30), zeroshot_M=(20, 100), timing_subset=2)
+    _fake_checkpoints(cfg)
+    return cfg
+
+
+def _sweep_runs():
+    from experiments import sweeps
+    return {"runtime_vs_M": sweeps.run_runtime_vs_M, "power": sweeps.run_power_sweep,
+            "wsr_vs_K": sweeps.run_wsr_vs_K, "runtime_vs_K": sweeps.run_runtime_vs_K,
+            "zeroshot": sweeps.run_zeroshot_M}
+
+
+def test_sweep_outputs_and_figures(sweep_env):
+    from pathlib import Path
+    for key, fn in _sweep_runs().items():
+        p, s = fn(sweep_env)
+        p = Path(p)
+        assert p.exists() and p.suffix == ".npz" and p.name.startswith("exp_0"), key
+        assert p.with_suffix(".csv").exists(), key
+        assert isinstance(s, dict) and s, key
+        for ext in (".png", ".pdf"):
+            f = os.path.join(sweep_env.paper_dir, SWEEP_FIGS[key] + ext)
+            assert os.path.exists(f) and os.path.getsize(f) > 0, f
+    names = sorted(os.listdir(os.path.join(sweep_env.root, "results")))
+    for pre in ("exp_04_", "exp_05_", "exp_06_", "exp_07_", "exp_08_"):
+        assert any(n.startswith(pre) and n.endswith(".npz") for n in names), pre
+    assert os.path.normpath(sweep_env.paper_dir) != os.path.normpath("E:/payam/Paper")
+
+
+def test_sweep_cache_reuse(sweep_env):
+    for key, fn in _sweep_runs().items():
+        p, s1 = fn(sweep_env)
+        m = os.path.getmtime(p)
+        time.sleep(0.05)
+        p2, s2 = fn(sweep_env)
+        assert str(p2) == str(p) and os.path.getmtime(p) == m, key
+        assert s1.keys() == s2.keys()
+
+
+def test_power_eta_both_statistics(sweep_env):
+    from experiments.sweeps import run_power_sweep
+    p, s = run_power_sweep(sweep_env)
+    z = np.load(p)
+    assert int(z["ao_baseline_max_iter"]) == sweep_env.ao_max_iter
+    assert s["ao_baseline_max_iter"] == float(sweep_env.ao_max_iter)
+    for n in NETS:
+        etas = []
+        for P in sweep_env.sweep_crn_dbm:
+            w, a = z[f"wsr_{n}_P{P}"], z[f"wsr_ao_P{P}"]
+            assert w.shape == a.shape == (sweep_env.n_test,)
+            rom = 100 * w.mean() / a.mean()
+            mor = 100 * np.mean(w / a)
+            assert s[f"eta_ratio_of_means_{n}_P{P}"] == pytest.approx(rom)
+            assert s[f"eta_mean_of_ratios_{n}_P{P}"] == pytest.approx(mor)
+            assert float(z[f"eta_ratio_of_means_{n}_P{P}"]) == pytest.approx(rom)
+            assert float(z[f"eta_mean_of_ratios_{n}_P{P}"]) == pytest.approx(mor)
+            etas.append(rom)
+        assert s[f"eta_range_{n}"] == pytest.approx((min(etas), max(etas)))
+    # AO is run fresh (efficient, cfg tol / max_iter) on each power set
+    import ao, data
+    P = sweep_env.sweep_crn_dbm[-1]
+    d = data.build_or_load(sweep_env, "sweep_power", P)
+    ch = d["ch"].to("cpu", torch.complex128)
+    p0, phi0 = ao.init_state(ch, d["theta0"])
+    r = ao.run_ao(ch, p0, phi0, mode="efficient", tol=sweep_env.ao_tol, max_iter=sweep_env.ao_max_iter)
+    assert np.allclose(z[f"wsr_ao_P{P}"], r.wsr_traj[:, -1].numpy(), rtol=1e-10)
+
+
+def test_runtime_has_both_ao_curves(sweep_env):
+    from experiments.sweeps import run_runtime_vs_K, run_runtime_vs_M
+    S = sweep_env.timing_subset
+    for fn, tag, pts in ((run_runtime_vs_M, "M", sweep_env.sweep_M), (run_runtime_vs_K, "K", sweep_env.sweep_K)):
+        p, s = fn(sweep_env)
+        z = np.load(p)
+        assert int(z["timing_n_samples"]) == S and s["timing_n_samples"] == float(S)
+        assert s["timing_threads"] == float(z["timing_threads"])
+        for x in pts:
+            for m in ("ao_explicit", "ao_efficient", "fonr", "maso", "tias"):
+                t = z[f"time_{m}_{tag}{x}"]
+                assert t.shape == (S,) and (t > 0).all()
+                assert s[f"runtime_ms_{m}_{tag}{x}"] == pytest.approx(1e3 * t.mean())
+    z = np.load(run_runtime_vs_M(sweep_env)[0])
+    # MASO for runtime-vs-M is instantiated at each M (M_train = M)
+    assert list(z["maso_M_train"]) == list(sweep_env.sweep_M)
+    assert str(z["device"]) == "cpu" and str(z["cdtype"]) == "complex128"
+
+
+def test_wsr_vs_K_contents(sweep_env):
+    from experiments.sweeps import run_wsr_vs_K
+    from experiments.convergence import load_trained_models
+    import data
+    p, s = run_wsr_vs_K(sweep_env)
+    z = np.load(p)
+    K = sweep_env.sweep_K[-1]
+    d = data.build_or_load(sweep_env, "sweep_K", K)
+    r = train.evaluate(load_trained_models(sweep_env)["fonr"], d["ch"], d["theta0"])
+    assert np.allclose(z[f"wsr_fonr_K{K}"], r["wsr_per_sample"].numpy(), rtol=1e-10)
+    for m in ("ao",) + NETS:
+        for k in sweep_env.sweep_K:
+            assert s[f"wsr_{m}_K{k}"] == pytest.approx(z[f"wsr_{m}_K{k}"].mean())
+    assert int(z["ao_baseline_max_iter"]) == sweep_env.ao_max_iter
+
+
+def test_zeroshot_includes_M80(sweep_env):
+    from experiments.sweeps import run_zeroshot_M
+    from experiments.convergence import load_trained_models
+    import data
+    p, s = run_zeroshot_M(sweep_env)
+    z = np.load(p)
+    assert list(z["M_values"]) == [20, 80, 100]
+    assert int(z["M_reference"]) == 80
+    for m in ("ao",) + NETS:
+        for M in (20, 80, 100):
+            assert f"wsr_{m}_M{M}_zeroshot" in s
+            assert z[f"wsr_{m}_M{M}"].shape == (sweep_env.n_test,)
+    d = data.build_or_load(sweep_env, "sweep_M", 100)
+    r = train.evaluate(load_trained_models(sweep_env)["maso"], d["ch"], d["theta0"])
+    assert np.allclose(z["wsr_maso_M100"], r["wsr_per_sample"].numpy(), rtol=1e-10)
+
+
+def test_gpu_timing_skips_without_cuda(sweep_env, monkeypatch, capsys):
+    from experiments import sweeps
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    p, s = sweeps.run_gpu_timing(sweep_env)
+    assert p is None and s.get("gpu_available") == 0.0
+    assert "cuda" in capsys.readouterr().out.lower()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_gpu_timing_runs(sweep_env):
+    from experiments import sweeps
+    p, s = sweeps.run_gpu_timing(sweep_env)
+    z = np.load(p)
+    assert os.path.basename(p) == "exp_supp_gpu_timing.npz"
+    assert os.path.exists(str(p)[:-4] + ".csv")
+    assert str(z["device"]) == "cuda" and str(z["cdtype"]) == "complex64"
+    for m in ("ao_explicit", "ao_efficient", "fonr", "maso", "tias"):
+        assert f"runtime_ms_{m}_M{sweep_env.sweep_M[0]}" in s
+        assert f"runtime_ms_{m}_K{sweep_env.sweep_K[0]}" in s
+        assert f"step_time_ms_{m}" in s
+    assert not any(f.startswith("gpu") for f in os.listdir(sweep_env.paper_dir))
