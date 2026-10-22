@@ -36,7 +36,7 @@ def _model(name):
     return build_model(name, cfg)
 
 
-MODELS = ["fonr", "maso"]  # TIAS is appended in Task 7
+MODELS = ["fonr", "maso", "tias"]
 
 
 def test_fonr_param_count():
@@ -318,3 +318,131 @@ def test_maso_degenerate_normalisation_keeps_phi():
     out32 = mm._normalise_or_keep(u32, phi32)
     assert torch.equal(out32[:, :, 5], phi32[:, :, 5])
     assert torch.isfinite(out32.real).all()
+
+
+# ---------------------------------------------------------------- TIAS (spec 6.4, §9 test 5)
+import copy  # noqa: E402
+
+from channels import ChannelBatch  # noqa: E402
+from models.tias import TIAS, tias_features, tias_messages  # noqa: E402
+
+
+def _tias_graph_case():
+    """Random channels with IRS 1 (index 0) empty and user 2 linked to no IRS."""
+    ch, p0, phi0 = _make(3, 20, 6, seed=21)
+    x = torch.zeros_like(ch.x)
+    x[:, 1, :] = 1.0
+    x[:, 1, 2] = 0.0  # user 2: no IRS link at all
+    ch = ChannelBatch(ch.hd, ch.b, x, ch.w, ch.P, ch.sigma2)
+    return ch, p0, phi0
+
+
+def test_tias_messages_equal_gradient_and_diag():
+    for case in ("default", "graph"):
+        ch, p0, phi0 = _make(4, 20, 6, seed=17) if case == "default" else _tias_graph_case()
+        p_new, aux = fp.deterministic_block(ch, p0, phi0)
+        for p in (p0, p_new):  # p0: generic c_k != 0; p_new: the state phase_update sees
+            u1, u2 = tias_messages(ch, p, phi0, aux)
+            assert u1.shape == phi0.shape and u1.is_complex()
+            assert u2.shape == phi0.shape and not u2.is_complex()
+            g = fp.grad_matrix_free(ch, p, phi0, aux)
+            assert torch.allclose(u1, g, rtol=1e-10, atol=0)
+            assert torch.allclose(u2, fp.diag_A(ch, p, aux), rtol=1e-10, atol=0)
+            # explicit matrices: g_n = v_n - A_n phi_n, u2 = diag(A_n)
+            A = fp.curvature_A(ch, p, aux)
+            Aphi = (A * phi0.unsqueeze(-2)).sum(-1)  # multiply-sum, no batched complex matmul
+            g_exp = fp.excitation_v(ch, p, aux) - Aphi
+            scale = float(g_exp.abs().max())
+            assert torch.allclose(u1, g_exp, rtol=1e-10, atol=1e-10 * scale)
+            assert torch.allclose(u2, torch.diagonal(A, dim1=-2, dim2=-1).real, rtol=1e-10, atol=0)
+        if case == "graph":
+            u1, u2 = tias_messages(ch, p_new, phi0, aux)
+            assert torch.all(u1[:, 0] == 0) and torch.all(u2[:, 0] == 0)
+            torch.manual_seed(0)
+            net = TIAS(L=1)
+            with torch.no_grad():
+                phi1 = net.phase_update(0, ch, p_new, phi0, aux)
+            assert torch.equal(phi1[:, 0], phi0[:, 0])
+            assert torch.allclose(phi1.abs(), torch.ones_like(phi1.real), atol=1e-12)
+
+
+def test_tias_param_count_independent_of_size():
+    for L in (1, 10, 25):
+        net = TIAS(L=L, hidden=32)
+        assert sum(p.numel() for p in net.parameters() if p.requires_grad) == 1249
+    net = build_model("tias", Config())
+    assert isinstance(net, TIAS) and net.L == 10
+    assert sum(p.numel() for p in net.parameters()) == 1249
+    assert all(not p.is_complex() and p.dtype == torch.float32 for p in net.parameters())
+    # the same weights run at any M and K (no size-dependent parameters)
+    for M, K in [(20, 6), (180, 6), (80, 60)]:
+        ch, p0, phi0 = _make(2, M, K)
+        with torch.no_grad():
+            net(ch, p0, phi0)
+    assert sum(p.numel() for p in net.parameters()) == 1249
+
+
+def test_tias_features_scale_invariant():
+    # (a) units change: hd, b x 1e3 with sigma^2 x 1e6 is the same physical system
+    ch, p0, phi0 = _make(4, 20, 6, seed=23)
+    s = 1e3
+    chs = ChannelBatch(ch.hd * s, ch.b * s, ch.x, ch.w, ch.P, ch.sigma2 * s * s)
+    feats = []
+    for c in (ch, chs):
+        aux = fp.aux_vars(c, p0, phi0)
+        u1, u2 = tias_messages(c, p0, phi0, aux)
+        feats.append(tias_features(c, u1, u2, phi0))
+    assert feats[0].shape == (4, 2, 20, 4)
+    assert torch.allclose(feats[0], feats[1], rtol=0, atol=1e-9)
+    # (b) the feature map itself: u1 -> a u1, u2 -> a2 u2 (b -> 1e3 b with c and Xi p fixed
+    #     gives a = 1e3, a2 = 1e6). Exact only while the fixed eps = 1e-12 terms are negligible,
+    #     i.e. |u1|, u2 and |u1|/u2 all >> 1e-12 before and after scaling.
+    gen = torch.Generator().manual_seed(4)
+    u1 = 1e3 * torch.randn(3, 2, 30, dtype=C128, generator=gen)
+    u2 = torch.rand(3, 2, 30, dtype=F64, generator=gen) + 0.1
+    phi = torch.exp(1j * 6.28 * torch.rand(3, 2, 30, dtype=F64, generator=gen))
+    ch3, _, _ = _make(3, 30, 6, seed=5)
+    f0 = tias_features(ch3, u1, u2, phi)
+    for a, a2 in [(1e3, 1e6), (1e6, 1e6), (1e3, 1.0), (1.0, 1e3)]:
+        assert torch.allclose(tias_features(ch3, a * u1, a2 * u2, phi), f0, rtol=0, atol=1e-9)
+
+
+def test_tias_features_definition():
+    ch, p0, phi0 = _tias_graph_case()
+    aux = fp.aux_vars(ch, p0, phi0)
+    u1, u2 = tias_messages(ch, p0, phi0, aux)
+    f = tias_features(ch, u1, u2, phi0)
+    eps = 1e-12
+    z = u1 * phi0.conj()
+    assert torch.allclose(f[..., 0], z.real / (u1.abs() + eps))
+    assert torch.allclose(f[..., 1], z.imag / (u1.abs() + eps))
+    assert torch.allclose(f[..., 3], (ch.x.sum(-1, keepdim=True) / 6).expand(-1, -1, 20))
+    # feature 3: standardised over the sample's nodes that have users; 0 at user-less nodes
+    raw = torch.log(u1.abs() / (u2 + eps) + eps)[:, 1]
+    ref = (raw - raw.mean(-1, keepdim=True)) / raw.std(-1, unbiased=False, keepdim=True)
+    assert torch.allclose(f[:, 1, :, 2], ref)
+    assert torch.all(f[:, 0, :, 2] == 0)
+
+
+def test_tias_update_formula():
+    torch.manual_seed(3)
+    net = TIAS(L=1)
+    ch, p0, phi0 = _make(2, 20, 6)
+    p_new, aux = fp.deterministic_block(ch, p0, phi0)
+    with torch.no_grad():
+        out = net.phase_update(0, ch, p_new, phi0, aux)
+        u1, u2 = tias_messages(ch, p_new, phi0, aux)
+        feats = tias_features(ch, u1, u2, phi0)
+        s = copy.deepcopy(net.mlp).double()(feats).squeeze(-1)
+    delta = 1e-12 * u2.amax(dim=(-2, -1), keepdim=True)
+    u = phi0 + s * u1 / (u2 + delta)
+    assert torch.allclose(out, u / u.abs(), atol=1e-12)
+
+
+def test_tias_grad_flows_complex64():
+    net = TIAS(L=2)
+    ch, p0, phi0 = _make(2, 80, 6, cdtype=torch.complex64)
+    tr = net(ch, p0, phi0)
+    fp.wsr(ch, tr.p[-1], tr.phi[-1]).mean().backward()
+    w = net.mlp[0].weight
+    assert w.dtype == torch.float32 and w.grad is not None and torch.isfinite(w.grad).all()

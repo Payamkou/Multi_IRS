@@ -22,5 +22,6 @@ def build_model(name: str, cfg, **kw) -> UnfoldedNet:
         return MASO(L=kw.pop("L", cfg.L), N=kw.pop("N", cfg.N),
                     M_train=kw.pop("M_train", cfg.maso_M_train), step_scale=step_scale)
     if name == "tias":
-        raise NotImplementedError(f"{name} is implemented in a later task")
+        from .tias import TIAS
+        return TIAS(L=kw.pop("L", cfg.L), hidden=kw.pop("hidden", cfg.tias_hidden))
     raise ValueError(f"unknown model {name!r}")
