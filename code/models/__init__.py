@@ -1,0 +1,17 @@
+"""Neural unfolded models (spec §6.2-6.5)."""
+from __future__ import annotations
+
+from .common import Trajectory, UnfoldedNet
+
+
+def build_model(name: str, cfg, **kw) -> UnfoldedNet:
+    name = name.lower()
+    if name == "fonr":
+        from .fonr import FONR, fonr_mu_init
+        mu_init = kw.pop("mu_init", None)
+        if mu_init is None:
+            mu_init = fonr_mu_init(cfg)
+        return FONR(L=kw.pop("L", cfg.L), T=kw.pop("T", cfg.T), mu_init=mu_init)
+    if name in ("maso", "tias"):
+        raise NotImplementedError(f"{name} is implemented in a later task")
+    raise ValueError(f"unknown model {name!r}")
