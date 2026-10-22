@@ -24,9 +24,10 @@ resumes from, and each can be re-run on its own after Cell 1. Artifacts live und
 (`datasets/`, `checkpoints/`, `logs/`, `results/`); figures (PNG 300 dpi + PDF) and `results_findings.md`
 go to `cfg.paper_dir`. `main.tex` is never touched.
 
-Full run (hours; resumable, so an interrupted run continues where it stopped):
+Full run (hours):
 
-`E:/payam/env/Scripts/python.exe -m jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 master_pipeline.ipynb`
+`E:/payam/env/Scripts/python.exe -m nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 master_pipeline.ipynb`
+(run from `E:/payam/code`; use `-m nbconvert`, not `-m jupyter nbconvert`, which can start a different Python's kernel; re-running the same command resumes from the saved artifacts)
 
 Smoke run (tiny config, temporary artifact root and paper dir, never touches the real ones): set the environment
 variable `IUF_SMOKE=1`.
@@ -85,7 +86,8 @@ if SMOKE:
                  sweep_M=(8, 16), sweep_K=(4, 6), sweep_crn_dbm=(20, 30), zeroshot_M=(8, 24),
                  train_device="cpu", eval_device="cpu",
                  root=os.path.join(_tmp, "artifacts"), paper_dir=os.path.join(_tmp, "Paper"))
-    assert "payam" not in cfg.root.lower() and "payam" not in cfg.paper_dir.lower()
+    assert os.path.normcase(cfg.root) != os.path.normcase(Config().root)
+    assert os.path.normcase(cfg.paper_dir) != os.path.normcase(Config().paper_dir)
     print("SMOKE RUN: tiny config; artifacts in", _tmp)
 else:
     cfg = Config(ao_max_iter=AO_MAX_ITER, timing_subset=TIMING_SUBSET)
@@ -143,6 +145,8 @@ Runs `pytest -q tests` in a subprocess (junit XML parsed into a per-file pass/fa
 `ao.sanity_check(cfg)`: full AO versus the power-only FP baseline on the validation split (pass iff the gain is
 at least 10 %). Resumes from the validation dataset in `datasets/` if present (else it is generated);
 `logs/sanity_check.json` is rewritten. Set the environment variable `IUF_SKIP_TESTS=1` to skip the pytest part.
+
+**The cell raises `RuntimeError` (loud banner) if any test fails or the sanity check fails**, so hours of compute are not started on a broken setup. Set the environment variable `IUF_ALLOW_TEST_FAILURE=1` to override and continue anyway.
 """)
 code(r'''
 import xml.etree.ElementTree as ET
@@ -166,15 +170,26 @@ if RUN_TESTS:
     tests_df["status"] = np.where((tests_df["failed"] + tests_df["error"]) == 0, "PASS", "FAIL")
     display(tests_df)
     print(f"pytest return code {_proc.returncode} in {time.time() - _t0:.0f} s")
-    if _proc.returncode != 0:
-        print("WARNING: some tests failed; tail of the pytest output follows")
+    TESTS_OK = _proc.returncode == 0
+    if not TESTS_OK:
         print(_proc.stdout[-3000:])
 else:
+    TESTS_OK = True
     print("pytest skipped (IUF_SKIP_TESTS=1)")
 
 sanity = ao.sanity_check(cfg)
 display(pd.Series(sanity, name="sanity_check").astype(str).to_frame())
 print("Sec. 5.1 sanity check:", "PASSED" if sanity["passed"] else "FAILED", f"(gain {sanity['gain_pct']:.1f} %)")
+_problems = [m for ok, m in ((TESTS_OK, "unit tests failed"), (bool(sanity["passed"]), "Sec. 5.1 sanity check failed")) if not ok]
+if _problems:
+    _msg = " and ".join(_problems)
+    print("!" * 70)
+    print(f"!!! STOP: {_msg} !!!")
+    print("!" * 70)
+    if os.environ.get("IUF_ALLOW_TEST_FAILURE") == "1":
+        print("IUF_ALLOW_TEST_FAILURE=1: continuing despite the failure")
+    else:
+        raise RuntimeError(f"{_msg}; fix it or set IUF_ALLOW_TEST_FAILURE=1 to continue anyway")
 ''')
 
 # ------------------------------------------------------------------ cell 3
@@ -288,7 +303,7 @@ print("model efficiency is relative to the baseline-cap teacher; the last row's 
 
 
 # ------------------------------------------------------------------ cells 8-10 (convergence figures)
-def conv_fig_cell(num, fig_no, fname, plot_fn, intro, extra):
+def conv_fig_cell(num, fig_no, fname, intro, extra):
     md(f"""
 ## Cell {num}: Fig. {fig_no} ({fname})
 
@@ -296,10 +311,9 @@ def conv_fig_cell(num, fig_no, fname, plot_fn, intro, extra):
 Resumes from `results/exp_01_convergence.npz`{extra}; recomputed only if the file is missing/stale (config hash and
 artifact fingerprint) or `FORCE_RERUN = True`.
 """)
-    return plot_fn
 
 
-conv_fig_cell(8, 1, "WSR_vs_iteration", None,
+conv_fig_cell(8, 1, "WSR_vs_iteration",
               "Mean WSR (95 % CI) versus layer / AO iteration for FONR, MASO, TIAS and FP-AO.", "")
 code(r'''
 conv_npz = convergence.run_convergence(cfg, force_rerun=FORCE_RERUN)
@@ -309,7 +323,7 @@ print(f"AO baseline mean {conv_sum['ao100_mean']:.4f}, AO-1000 mean {conv_sum['a
 show_keys(conv_sum, ["recovery_pct_"])
 ''')
 
-conv_fig_cell(9, 2, "WSR_vs_wall_clock", None,
+conv_fig_cell(9, 2, "WSR_vs_wall_clock",
               "Mean WSR versus cumulative CPU wall-clock time (batch 1, complex128, `cfg.timing_threads` threads).", "")
 code(r'''
 conv_npz = convergence.run_convergence(cfg, force_rerun=FORCE_RERUN)
