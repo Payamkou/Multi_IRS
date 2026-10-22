@@ -1222,8 +1222,11 @@ DEVIATIONS = [
               "error.",
               "complex64 eigen-decomposition of rank-deficient / ill-conditioned Hermitian matrices can fail to "
               "converge on the GPU. Build-time measurement (final review, default cuSOLVER backend): 34–77 % of "
-              "samples failed in both AO modes; MAGMA is used to reduce this. Residual failures bias the GPU AO "
-              "means toward the samples that succeeded.",
+              "samples failed in both AO modes. MAGMA removes most failures for the 10-iteration per-iteration "
+              "timings (0–10 % measured) but NOT for run-to-convergence (65–85 % in both modes): FP-AO run to "
+              "convergence is numerically unstable in complex64 on the GPU. Its GPU time (and the per-iteration "
+              "time taken from those runs) is therefore reported as not available with the failure %, never as a "
+              "mean over the surviving samples.",
               evidence_fn=_ev_gpu_fail),
     Deviation("builder_calls", "Other builder's calls", "Sec. II / V / VI-A (not specified)", "VI",
               "User k even → CRN, odd → PMN (K = 6 gives 3 + 3 with exactly the listed weights); shadowing drawn "
@@ -1277,7 +1280,7 @@ def _section_ao_power(art, ao) -> list:
         return out + ["Teacher labels are stale for this config: not evaluated.", ""]
     if o.get("error"):
         return out + [f"Not evaluated ({o['error']}).", ""]
-    cols = [("baseline", ao)] + ([("ref1000", "AO-1000")] if o.get("ref1000") else [])
+    cols = [("baseline", f"baseline ({ao})")] + ([("ref1000", "reference (AO-1000)")] if o.get("ref1000") else [])
     rows = [["% of test samples with exactly one active user (p > 1e-12·P)"]
             + [_fmt(100 * o[c]["frac_one_active"]) for c, _ in cols],
             ["% of user powers exactly 0"] + [_fmt(100 * o[c]["frac_zero_power"]) for c, _ in cols],
@@ -1375,6 +1378,17 @@ def _section_metrics(art) -> list:
     return out
 
 
+GPU_SWEEP_MAX_FAIL_PCT = 10.0   # a per-iteration sweep point is usable as the default-setting GPU number up to this
+
+
+def _gpu_conv_unavailable(g: Optional[dict]) -> str:
+    """Cell text for a GPU AO run-to-convergence number that is not reported (Task 16 E ruling)."""
+    pe = _fmt((g or {}).get("ao_conv_pct_failed_explicit"))
+    pf = _fmt((g or {}).get("ao_conv_pct_failed_efficient"))
+    return (f"not available — numerically unstable in complex64 on GPU (failed {pe} % explicit / "
+            f"{pf} % efficient)")
+
+
 def _fmt_gpu(v, pct) -> str:
     """GPU cell: value plus the failure % for AO methods (always shown, also 0)."""
     return _fmt(v) if pct is None else f"{_fmt(v)} [{_fmt(pct)} % failed]"
@@ -1422,16 +1436,41 @@ def _section_latency(cfg, S) -> list:
     for n in NETS:
         c = None if not conv else conv[f"layer_time_ms_{n}"] / cfg.L
         rows.append([f"{NET[n]} per layer", _fmt(c), _fmt(gpu.get(f"step_time_ms_{n}") if gpu else None)])
+    na = _gpu_conv_unavailable(gpu)
+    from_sweep = []
     for mode in AO_MODES:
         c = None
         if conv and conv.get(f"ao_conv_iters_mean_{mode}"):
             c = conv[f"ao_conv_time_ms_{mode}"] / conv[f"ao_conv_iters_mean_{mode}"]
         fp = _gpu_fail_pct(gpu, f"ao_{mode}", "conv")
-        rows.append([f"FP-AO ({mode}) per iteration", _fmt(c),
-                     _fmt_gpu(gpu.get(f"step_time_ms_ao_{mode}") if gpu else None, fp)])
+        failed = bool(gpu) and (fp is None or fp > 0)
+        if not gpu:
+            g_it = g_conv = _fmt(None)
+        elif not failed:
+            g_it = _fmt_gpu(gpu.get(f"step_time_ms_ao_{mode}"), fp)
+            g_conv = _fmt_gpu(gpu.get(f"ao_conv_time_ms_{mode}"), fp)
+        else:
+            g_conv = na
+            key = f"M{cfg.M}"
+            sp = _gpu_fail_pct(gpu, f"ao_{mode}", key)
+            sv = gpu.get(f"runtime_ms_ao_{mode}_{key}")
+            if sv is not None and sp is not None and sp <= GPU_SWEEP_MAX_FAIL_PCT and not math.isnan(sv):
+                g_it = _fmt_gpu(sv, sp) + " †"
+                from_sweep.append(mode)
+            else:
+                g_it = na
+        rows.append([f"FP-AO ({mode}) per iteration", _fmt(c), g_it])
         rows.append([f"FP-AO ({mode}) to convergence", _fmt(conv.get(f"ao_conv_time_ms_{mode}") if conv else None),
-                     _fmt_gpu(gpu.get(f"ao_conv_time_ms_{mode}") if gpu else None, fp)])
+                     g_conv])
     out += [_table(["quantity (ms)", "CPU", "GPU"], rows), ""]
+    if gpu and (na in "".join(str(r[2]) for r in rows) or from_sweep):
+        out += ["GPU FP-AO run to convergence (complex64) fails in a share of the samples (eigvalsh LinAlgError), "
+                "so its time is reported as not available instead of a mean over the surviving samples (which "
+                "would be biased). " + (
+                    "† GPU per-iteration time of FP-AO (" + ", ".join(from_sweep) + ") is taken from the per-iteration "
+                    f"sweep point M = {cfg.M}, K = {cfg.K} (mean of the first L iterations, failure % ≤ "
+                    f"{GPU_SWEEP_MAX_FAIL_PCT:g}), not from the run-to-convergence samples." if from_sweep else
+                    "The per-iteration GPU time taken from the same runs is not available either."), ""]
     if gpu:
         out += ["Method ordering on GPU vs CPU: " + ("unchanged at every point." if not changes else
                                                      "CHANGES at " + "; ".join(changes) + "."), ""]

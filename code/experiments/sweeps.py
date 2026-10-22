@@ -61,7 +61,9 @@ Methods m: ao_explicit, ao_efficient, fonr, maso, tias for timing; ao, fonr, mas
 * run_zeroshot_M:    ``wsr_{m}_M{M}_zeroshot`` (mean), ``eta_{n}_M{M}_zeroshot`` (%),
   ``M_reference``, ``ao_baseline_max_iter``
 * run_gpu_timing:    ``gpu_available``; if 1 also ``runtime_ms_{m}_M{M}``, ``runtime_ms_{m}_K{K}``,
-  ``step_time_ms_{m}`` (mean per layer / per AO iteration), ``ao_conv_time_ms_{mode}``,
+  ``step_time_ms_{m}`` (mean per layer / per AO iteration), ``ao_conv_time_ms_{mode}`` and
+  ``step_time_ms_ao_{mode}`` (NaN = not available when any run-to-convergence sample of that mode failed:
+  a survivor mean would be biased), ``ao_conv_available_{mode}`` (1/0),
   ``ao_conv_n_failed_{mode}``, ``ao_conv_pct_failed_{mode}``, ``runtime_n_failed_{m}_{tag}{x}`` and
   ``runtime_pct_failed_{m}_{tag}{x}`` (always present, zeros included), ``timing_threads``,
   ``timing_n_samples``. Returns ``(None, {"gpu_available": 0.0})`` without CUDA. GPU complex64 only, with
@@ -394,6 +396,9 @@ def summarize_power(z, pts) -> dict:
     return s
 
 
+NOT_AVAILABLE = float("nan")   # one shared NaN object, so equal summaries compare equal
+
+
 def summarize_gpu(z, Ms, Ks) -> dict:
     """Summary of the supplementary GPU timing (keys in the module docstring)."""
     s = {"gpu_available": 1.0}
@@ -403,9 +408,15 @@ def summarize_gpu(z, Ms, Ks) -> dict:
         s[f"step_time_ms_{m}"] = _nanstat(np.nanmean, _step_times(z, m))
     for mode in AO_MODES:
         c = z[f"ao_cumtime_{mode}"]
-        s[f"ao_conv_time_ms_{mode}"] = _nanstat(np.nanmean, c)
-        s[f"ao_conv_n_failed_{mode}"] = float(np.isnan(c).sum())
+        nf = int(np.isnan(c).sum())
+        s[f"ao_conv_n_failed_{mode}"] = float(nf)
         s[f"ao_conv_pct_failed_{mode}"] = float(100 * np.isnan(c).mean())
+        # ruling (Task 16 E): a mean over the surviving samples is biased, so run-to-convergence time and the
+        # per-iteration time taken from those same runs are NaN ("not available") as soon as one sample failed
+        s[f"ao_conv_available_{mode}"] = float(nf == 0)
+        s[f"ao_conv_time_ms_{mode}"] = _nanstat(np.nanmean, c) if nf == 0 else NOT_AVAILABLE
+        if nf:
+            s[f"step_time_ms_ao_{mode}"] = NOT_AVAILABLE
     return s
 
 

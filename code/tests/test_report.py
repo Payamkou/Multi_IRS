@@ -505,8 +505,39 @@ def test_gpu_failure_pct_beside_every_gpu_ao_number(synth):
     md = report.build_report(synth).read_text(encoding="utf-8")
     lat = md.split(report.SECTION_HEADINGS[5], 1)[1].split(report.SECTION_HEADINGS[6], 1)[0]
     assert "% failed]" in lat and "BOTH AO modes" in lat
-    n_ao_cells = 2 * (len(synth.sweep_M) + len(synth.sweep_K)) + 4   # sweep tables + per-iter/conv rows
+    # sweep tables + default-setting rows: explicit run-to-convergence failed (1/6) -> its conv cell is
+    # "not available" and its per-iteration cell comes from the M = 80 sweep point (†); efficient keeps both
+    n_ao_cells = 2 * (len(synth.sweep_M) + len(synth.sweep_K)) + 3
     assert lat.count("% failed]") == n_ao_cells + 1                    # + the legend sentence
+    assert lat.count("not available — numerically unstable in complex64 on GPU (failed 16.67 % explicit / "
+                     "0 % efficient)") == 1
+    assert "% failed] †" in lat and "sweep point M = 80, K = 6" in lat
     assert "FP-AO (explicit): runtime sweeps" in lat and "FP-AO (efficient): runtime sweeps" in lat
     dev = md.split(report.SECTION_HEADINGS[3], 1)[1]
     assert "EITHER AO mode" in dev and "magma" in dev
+    assert "NOT for run-to-convergence" in dev and "MAGMA is used to reduce this" not in dev
+
+
+def test_gpu_conv_not_available_when_every_mode_fails(synth):
+    """Task 16 E: no survivor mean for GPU run-to-convergence; per-iteration falls back to 'not available'
+    when the default-M sweep point has > 10 % failures."""
+    import report
+    S, _ = report.collect_summaries(synth)
+    g = dict(S["gpu"])
+    for mode in ("explicit", "efficient"):
+        g[f"ao_conv_pct_failed_{mode}"] = 70.0
+        g[f"runtime_pct_failed_ao_{mode}_M80"] = 55.0
+    md = report.build_report(synth, summaries={"gpu": g}).read_text(encoding="utf-8")
+    lat = md.split(report.SECTION_HEADINGS[5], 1)[1].split(report.SECTION_HEADINGS[6], 1)[0]
+    assert lat.count("not available — numerically unstable in complex64 on GPU (failed 70 % explicit / "
+                     "70 % efficient)") == 4
+    assert "†" not in lat.split("### Default", 1)[1].split("Method ordering", 1)[0].replace("† GPU", "")
+
+
+def test_ao_power_columns_labelled_by_role(synth):
+    import report
+    P = torch.full((2, 3), 0.1, dtype=torch.float64)
+    _fake_teacher(synth, torch.tensor([[0.1, 0.0, 0.0], [0.1, 0.1, 0.1]], dtype=torch.float64), P)
+    md = report.build_report(synth).read_text(encoding="utf-8")
+    sec = md.split("single active user", 1)[1].split("Why:", 1)[0]
+    assert "| quantity | baseline (AO-" in sec
