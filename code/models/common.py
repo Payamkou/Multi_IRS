@@ -54,3 +54,14 @@ class UnfoldedNet(nn.Module):
         p, phi = state
         p_new, phi_new, _ = self._layer(i, ch, p, phi)
         return (p_new, phi_new)
+
+    def to_precision(self, cdtype) -> "UnfoldedNet":
+        """Cast parameters AND buffers to the real dtype matching ``cdtype``; returns self."""
+        rdtype = torch.float32 if cdtype == torch.complex64 else torch.float64
+        for prm in self.parameters():
+            prm.data = prm.data.to(rdtype)
+        for mod in self.modules():
+            for name, buf in list(mod._buffers.items()):
+                if buf is not None and buf.is_floating_point():
+                    mod._buffers[name] = buf.to(rdtype)
+        return self
