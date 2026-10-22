@@ -59,16 +59,47 @@ def received_power(ch: ChannelBatch, p: torch.Tensor, H: torch.Tensor) -> torch.
     return (p * H.abs() ** 2).sum(-1) + ch.sigma2
 
 
-def sinr(p: torch.Tensor, H: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
-    """gamma_k = p_k|H_k|^2 / (D - p_k|H_k|^2)  -> (B,K)."""
+def sinr(p: torch.Tensor, H: torch.Tensor, D: torch.Tensor, sigma2=None) -> torch.Tensor:
+    """gamma_k = S_k / I_k with S_k = p_k|H_k|^2, I_k = sigma^2 + sum_{i!=k} S_i  -> (B,K).
+
+    The interference is summed directly over the other users (O(K^2) mask, no matmul)
+    instead of D - S_k, which cancels catastrophically for a high-SINR user in float32.
+    If ``sigma2`` is omitted it is recovered as D - sum_i S_i (only noise is cancelled).
+    """
     S = p * H.abs() ** 2
-    return S / (D.unsqueeze(-1) - S)
+    K = S.shape[-1]
+    off = 1.0 - torch.eye(K, dtype=S.dtype, device=S.device)
+    noise = (D - S.sum(-1)).unsqueeze(-1) if sigma2 is None else sigma2
+    return S / ((S.unsqueeze(-2) * off).sum(-1) + noise)
+
+
+class _SafeSqrt(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        y = torch.sqrt(x)
+        ctx.save_for_backward(x, y)
+        return y
+
+    @staticmethod
+    def backward(ctx, g):
+        x, y = ctx.saved_tensors
+        pos = x > torch.finfo(x.dtype).tiny
+        return torch.where(pos, g / (2 * torch.where(pos, y, torch.ones_like(y))), torch.zeros_like(g))
+
+
+def safe_sqrt(x: torch.Tensor) -> torch.Tensor:
+    """sqrt(x) (identical forward) with gradient 0 for x <= finfo.tiny instead of inf/NaN.
+
+    Used for sqrt(wt p): a user whose power is clamped to exactly 0 otherwise yields
+    0 * inf = NaN in backward.
+    """
+    return _SafeSqrt.apply(x)
 
 
 def wsr(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor, base: str = "2") -> torch.Tensor:
     """Weighted sum rate (B,); base "2" gives bits, base "e" gives nats."""
     H = effective_channel(ch, phi)
-    r = (ch.w * torch.log1p(sinr(p, H, received_power(ch, p, H)))).sum(-1)
+    r = (ch.w * torch.log1p(sinr(p, H, received_power(ch, p, H), ch.sigma2))).sum(-1)
     if base == "e":
         return r
     if base == "2":
@@ -81,9 +112,9 @@ def aux_vars(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor) -> Aux:
     """alpha = gamma, wt = w(1+alpha), eps = sqrt(wt p) H / D, Xi = sum |eps|^2."""
     H = effective_channel(ch, phi)
     D = received_power(ch, p, H)
-    alpha = sinr(p, H, D)
+    alpha = sinr(p, H, D, ch.sigma2)
     wt = ch.w * (1 + alpha)
-    eps = torch.sqrt(wt * p) * H / D.unsqueeze(-1)
+    eps = safe_sqrt(wt * p) * H / D.unsqueeze(-1)
     Xi = (eps.abs() ** 2).sum(-1)
     return Aux(alpha=alpha, wt=wt, eps=eps, Xi=Xi, H=H, D=D)
 
@@ -108,7 +139,7 @@ def surrogate_f3(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor,
     H = effective_channel(ch, phi)
     D = received_power(ch, p, H)
     Xi = (eps.abs() ** 2).sum(-1)
-    return 2 * (eps.conj() * torch.sqrt(wt * p) * H).real.sum(-1) - Xi * D
+    return 2 * (eps.conj() * safe_sqrt(wt * p) * H).real.sum(-1) - Xi * D
 
 
 def deterministic_block(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor):
@@ -121,7 +152,7 @@ def deterministic_block(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor):
 def obs_scalar(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor, aux: Aux) -> torch.Tensor:
     """c_k = sqrt(wt_k p_k) eps_k - Xi p_k H_k(phi), H recomputed from phi  -> (B,K)."""
     H = effective_channel(ch, phi)
-    return torch.sqrt(aux.wt * p) * aux.eps - aux.Xi.unsqueeze(-1) * p * H
+    return safe_sqrt(aux.wt * p) * aux.eps - aux.Xi.unsqueeze(-1) * p * H
 
 
 def grad_matrix_free(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor, aux: Aux) -> torch.Tensor:
@@ -132,7 +163,7 @@ def grad_matrix_free(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor, aux: 
 
 def excitation_v(ch: ChannelBatch, p: torch.Tensor, aux: Aux) -> torch.Tensor:
     """v_n = sum_k x_{n,k} (sqrt(wt p) eps - Xi p hd) b_{n,k}  (hd NOT conjugated)."""
-    coef = torch.sqrt(aux.wt * p) * aux.eps - aux.Xi.unsqueeze(-1) * p * ch.hd
+    coef = safe_sqrt(aux.wt * p) * aux.eps - aux.Xi.unsqueeze(-1) * p * ch.hd
     return _sum_users(ch, coef)
 
 

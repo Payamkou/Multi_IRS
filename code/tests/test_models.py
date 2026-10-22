@@ -491,3 +491,21 @@ def test_tias_grads_finite_all_empty_sample(cdtype):
     fp.wsr(ch, tr.p[-1], tr.phi[-1]).sum().backward()
     for prm in net.parameters():
         assert prm.grad is not None and torch.isfinite(prm.grad).all()
+
+
+def test_fonr_complex64_grads_finite_with_zero_power_user():
+    """A user with p = 0 stays at 0 through every layer; sqrt(wt p) must not give NaN grads."""
+    torch.manual_seed(0)
+    net = FONR(L=10, T=3, mu_init=MU0)
+    ch, p0, phi0 = _make(4, 20, 6, cdtype=torch.complex64)
+    p0 = p0.clone()
+    p0[:, 1] = 0.0
+    tr = net(ch, p0, phi0)
+    assert torch.all(tr.p[:, :, 1] == 0)
+    H = fp.effective_channel(ch, tr.phi[-1])
+    eps = fp.aux_vars(ch, tr.p[-1], tr.phi[-1]).eps
+    loss = -fp.wsr(ch, tr.p[-1], tr.phi[-1], base="e").mean() \
+        - fp.surrogate_f3(ch, tr.p[-1], tr.phi[-1], ch.w, eps).mean()
+    loss.backward()
+    assert net.mu.grad is not None and torch.isfinite(net.mu.grad).all()
+    assert net.mu.grad.abs().sum() > 0

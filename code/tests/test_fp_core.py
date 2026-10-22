@@ -174,3 +174,55 @@ def test_contractions_deterministic_and_exact_multithreaded():
             assert _rel_close(fp.excitation_v(chb, p, aux), v_ref, 1e-12)
     finally:
         torch.set_num_threads(old)
+
+
+# ---------------------------------------------------------------- numerical-safety fixes
+def _high_sinr_batch(cdtype):
+    """B=1, K=3; user 0 has |H|^2 = 1e8 so S_0 >> sigma^2 + interference (gamma_0 = 5e7)."""
+    from channels import ChannelBatch
+    rdtype = torch.float32 if cdtype == torch.complex64 else F64
+    K, N, M = 3, 2, 4
+    hd = torch.tensor([[1e4, 1.0, 1.0]], dtype=cdtype)
+    b = torch.zeros(1, N, K, M, dtype=cdtype)
+    return ChannelBatch(hd=hd, b=b, x=torch.zeros(1, N, K, dtype=rdtype),
+                        w=torch.ones(1, K, dtype=rdtype), P=torch.ones(1, K, dtype=rdtype)), \
+        torch.ones(1, N, M, dtype=cdtype)
+
+
+def test_sinr_complex64_matches_complex128_at_high_sinr():
+    ref = None
+    for cdtype in (C128, torch.complex64):
+        chb, phi = _high_sinr_batch(cdtype)
+        rdtype = chb.w.dtype
+        p = torch.tensor([[1.0, 0.5, 0.5]], dtype=rdtype)
+        a = fp.aux_vars(chb, p, phi).alpha
+        H = fp.effective_channel(chb, phi)
+        g = fp.sinr(p, H, fp.received_power(chb, p, H), chb.sigma2)
+        assert torch.equal(a, g)
+        if ref is None:
+            ref = a
+            assert abs(float(ref[0, 0]) - 1e8 / 2.0) < 1e-6 * 1e8  # S=1e8, I=1+0.5+0.5
+        else:
+            rel = ((a.double() - ref) / ref).abs().max()
+            assert torch.isfinite(a).all() and float(rel) < 1e-5
+
+
+def test_sinr_matches_definition(setup):
+    chb, p, phi = setup
+    H = fp.effective_channel(chb, phi)
+    D = fp.received_power(chb, p, H)
+    S = p * H.abs() ** 2
+    want = S / (D.unsqueeze(-1) - S)
+    assert _rel_close(fp.sinr(p, H, D, chb.sigma2), want, 1e-12)
+    assert _rel_close(fp.sinr(p, H, D), want, 1e-12)  # sigma2 omitted -> derived from D
+
+
+def test_safe_sqrt_forward_and_grad():
+    for dt in (torch.float32, F64):
+        x = torch.tensor([0.0, 1e-50 if dt == F64 else 0.0, 4.0, 2.25], dtype=dt, requires_grad=True)
+        y = fp.safe_sqrt(x)
+        assert torch.equal(y.detach(), torch.sqrt(x.detach()))
+        y.sum().backward()
+        assert torch.isfinite(x.grad).all()
+        assert x.grad[0] == 0
+        assert torch.allclose(x.grad[2:], 0.5 / torch.sqrt(x.detach()[2:]))

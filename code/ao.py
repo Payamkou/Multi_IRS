@@ -33,7 +33,7 @@ def lambda_max(ch: ChannelBatch, p: torch.Tensor, aux: fp.Aux, mode: str) -> tor
     _check_mode(mode)
     if mode == "explicit":
         return torch.linalg.eigvalsh(fp.curvature_A(ch, p, aux))[..., -1]
-    s = torch.sqrt(ch.x.to(p.dtype) * p.unsqueeze(1))                       # (B,N,K)
+    s = fp.safe_sqrt(ch.x.to(p.dtype) * p.unsqueeze(1))                       # (B,N,K)
     gram = torch.einsum("bnkm,bnlm->bnkl", ch.b.conj(), ch.b)                # b_k^H b_l
     scale = aux.Xi.view(-1, 1, 1, 1) * s.unsqueeze(-1) * s.unsqueeze(-2)    # (B,N,K,K)
     G = scale.to(gram.dtype) * gram
