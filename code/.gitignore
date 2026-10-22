@@ -1,2 +1,5 @@
 smoke_run.ipynb
 smoke.log
+run.log
+__pycache__/
+.pytest_cache/

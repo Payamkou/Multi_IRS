@@ -4,7 +4,7 @@ The notebook only orchestrates: every code cell calls ``nb_helpers`` (which call
 experiments / report) and displays the returned tables and figures. The end-to-end check of the same calls
 on a tiny configuration lives in ``tests/test_pipeline_e2e.py``.
 
-Run: E:/payam/env/Scripts/python.exe make_notebook.py
+Run (from E:/payam/code): E:/payam/env/Scripts/python.exe scripts/make_notebook.py
 """
 import nbformat as nbf
 from nbformat import v4
@@ -84,6 +84,13 @@ TIMING_SUBSET = 200      # batch-1 timing samples per point
 RESUME = True
 FORCE_RETRAIN = False
 FORCE_RERUN = False
+
+import os
+import sys
+
+SRC = os.path.abspath("src")      # the notebook lives in code/, the library in code/src
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
 
 import pandas as pd
 from IPython.display import Markdown, display
@@ -247,6 +254,6 @@ nbf.validate(NOTEBOOK)
 
 if __name__ == "__main__":
     import os
-    nbf.write(NOTEBOOK, os.path.join(os.path.dirname(os.path.abspath(__file__)), "master_pipeline.ipynb"))
+    nbf.write(NOTEBOOK, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "master_pipeline.ipynb"))
     print("wrote master_pipeline.ipynb:", sum(c.cell_type == "code" for c in cells), "code cells,",
           sum(c.cell_type == "markdown" for c in cells), "markdown cells")

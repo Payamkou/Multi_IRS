@@ -32,7 +32,7 @@ import train
 from config import Config
 from experiments import convergence, sweeps
 
-CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # code/ (src/ lives inside it)
 NETS = ("fonr", "maso", "tias")
 NET = {"fonr": "FONR", "maso": "MASO", "tias": "TIAS"}
 TABLE_I_AO_MAX_ITER = 100

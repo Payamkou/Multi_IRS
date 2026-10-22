@@ -36,7 +36,7 @@ def test_replace_gives_up_after_five_tries(tmp_path, monkeypatch):
 def test_all_writers_use_the_helper():
     """No project module calls os.replace directly (atomic.py itself excepted); scans every code module."""
     import glob
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    here = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
     mods = [p for p in glob.glob(os.path.join(here, "**", "*.py"), recursive=True)
             if os.sep + "tests" + os.sep not in p and os.path.basename(p) != "atomic.py"]
     rels = {os.path.relpath(p, here).replace(os.sep, "/") for p in mods}
