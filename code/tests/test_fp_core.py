@@ -174,3 +174,32 @@ def test_contractions_deterministic_and_exact_multithreaded():
             assert _rel_close(fp.excitation_v(chb, p, aux), v_ref, 1e-12)
     finally:
         torch.set_num_threads(old)
+
+
+def test_block_refreshes_eps_after_power(setup):
+    """Spec §6.1 step 3: alpha/wt from the INPUT state; eps, Xi, H, D refreshed at p_new."""
+    chb, p, phi = setup
+    p_new, aux = fp.deterministic_block(chb, p, phi)
+    H = fp.effective_channel(chb, phi)
+    D_in = fp.received_power(chb, p, H)
+    assert torch.allclose(aux.alpha, fp.sinr(p, H, D_in), rtol=1e-12, atol=0)
+    assert torch.allclose(aux.wt, chb.w * (1 + fp.sinr(p, H, D_in)), rtol=1e-12, atol=0)
+    D_new = fp.received_power(chb, p_new, H)
+    eps_ref = torch.sqrt(aux.wt * p_new) * H / D_new.unsqueeze(-1)
+    assert torch.allclose(aux.H, H, rtol=1e-12, atol=0)
+    assert torch.allclose(aux.D, D_new, rtol=1e-12, atol=0)
+    assert torch.allclose(aux.eps, eps_ref, rtol=1e-12, atol=0)
+    assert torch.allclose(aux.Xi, (eps_ref.abs() ** 2).sum(-1), rtol=1e-12, atol=0)
+
+
+def test_phase_gradient_nondegenerate_for_unclipped_users():
+    """Old order gave c_k ~ 1e-20 for every user not clipped at P_peak (spec §6.1)."""
+    chb, theta0 = generate_channels(Config(), 200, seed=2024)
+    chb = chb.to("cpu", C128)
+    phi = torch.exp(1j * theta0).to(C128)
+    p0 = chb.P.clone()
+    p_new, aux = fp.deterministic_block(chb, p0, phi)
+    c = fp.obs_scalar(chb, p_new, phi, aux)
+    unclipped = p_new < chb.P * (1 - 1e-9)
+    assert int(unclipped.sum()) > 0
+    assert float(c.abs()[unclipped].median()) > 1e-8
