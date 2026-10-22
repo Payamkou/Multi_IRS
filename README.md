@@ -34,67 +34,18 @@ Every figure in the paper's Numerical Results section is produced by real simula
 
 ## 1. Overview flowchart
 
-```mermaid
-flowchart TD
-    subgraph SRC["Sources of truth"]
-        P["Paper/main.tex<br/>system model, methods,<br/>experiment design"]
-        B["Base-methods/<br/>FP I and II, DUFP, DeepFP, GNNFP"]
-        S["docs/superpowers/specs/<br/>design spec<br/>(math corrections, decisions)"]
-    end
+<p align="center">
+  <img src="docs/figures/pipeline_overview.svg" alt="End-to-end pipeline of the Intelligent Unfolding Framework" width="100%"/>
+</p>
 
-    subgraph DATA["1. Data"]
-        G["Channel generator<br/>2 IRSs, ULA, Rician/Rayleigh,<br/>path loss + shadowing"]
-        A["Single-surface association<br/>x(k,n) = argmax over n of ||b(k,n)||"]
-        D["Cached datasets<br/>train 10^4, val 10^3, test 10^3<br/>+ 10^3 per sweep point"]
-        G --> A --> D
-    end
+**Fig. 1. End-to-end pipeline of the study.**
+- **(1) Data generation:** channel realisations are generated for the two-IRS uplink and associated to the IRSs, then cached.
+- **(2) FP-AO baseline:** the model-driven baseline is the Lagrangian-dual plus quadratic-transform FP with an MM phase step. It is validated by the sanity check and provides the teacher labels Φ\* and the AO reference.
+- **(3) Unfolded architectures:** FONR, MASO and TIAS share the deterministic FP block and differ only in the learned phase update, applied for L = 10 layers.
+- **(4) Hybrid training:** an LR pilot, then supervised warm-start (Stage I), then unsupervised deep supervision (Stage II), with resumable checkpoints.
+- **(5) Evaluation:** the trained models are evaluated without retraining across all sweeps. This produces the eight paper figures and the claim-by-claim findings report.
 
-    subgraph TEACH["2. Model-driven baseline"]
-        AO["FP-AO<br/>Lagrangian dual + quadratic transform<br/>closed-form power, MM phase step"]
-        SC{"Sanity check (val)<br/>full AO vs power-only<br/>at least 10% gain"}
-        TL["Teacher labels Phi*<br/>(AO-100) + AO-1000 reference"]
-        AO --> SC --> TL
-    end
-
-    subgraph NETS["3. Unfolded architectures (L = 10)"]
-        DB["Shared deterministic block<br/>alpha, beta/eps, power law"]
-        F["FONR<br/>T = 3 learned scalar theta-steps"]
-        M["MASO<br/>MLP preconditioner on the<br/>Riemannian gradient"]
-        T["TIAS<br/>bipartite message passing,<br/>shared node MLP"]
-        DB --> F & M & T
-    end
-
-    subgraph TRAIN["4. Hybrid training (GPU)"]
-        LR["LR pilot<br/>{0.1, 0.01, 0.001}, val only"]
-        S1["Stage I: supervised<br/>phase-alignment loss (epochs 1-50)"]
-        S2["Stage II: unsupervised<br/>deep supervision, -0.5 R - 0.5 f_q<br/>(epochs 51-200)"]
-        CK["Checkpoints best.pt / last.pt<br/>exact resume, CSV logs"]
-        LR --> S1 --> S2 --> CK
-    end
-
-    subgraph EXP["5. Experiments (8 paper figures)"]
-        E1["Fig. 1-3: convergence,<br/>wall-clock, gap CDF"]
-        E2["Fig. 4, 7: runtime vs M and K<br/>(CPU, batch 1, fair timing)"]
-        E3["Fig. 5: efficiency vs CRN power"]
-        E4["Fig. 6, 8: zero-shot K and M"]
-        GPU["Supplementary GPU timing"]
-    end
-
-    R["6. Findings report<br/>Paper/results_findings.md<br/>claim-by-claim verdicts + deviations"]
-    FIG["Paper/*.png + *.pdf<br/>(filenames used by main.tex)"]
-
-    P --> S
-    B --> S
-    S --> G
-    D --> AO
-    D --> DB
-    TL --> S1
-    CK --> E1 & E2 & E3 & E4 & GPU
-    TL --> E1
-    E1 & E2 & E3 & E4 --> FIG
-    E1 & E2 & E3 & E4 & GPU --> R
-    FIG --> R
-```
+Dashed loops are iterations; the dashed long arrow carries the FP-AO reference used in every comparison. Source file: [`docs/figures/pipeline_overview.svg`](docs/figures/pipeline_overview.svg).
 
 ---
 

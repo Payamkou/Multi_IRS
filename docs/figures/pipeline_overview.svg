@@ -1,0 +1,234 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 660" width="1320" height="660" font-family="Times New Roman, Times, serif">
+  <title>Intelligent Unfolding Framework: end-to-end pipeline</title>
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+    <style>
+      .stage { stroke: #555; stroke-width: 1.2; }
+      .hdr   { font-size: 15px; font-weight: bold; fill: #111; text-anchor: middle; }
+      .box   { fill: #fff; stroke: #333; stroke-width: 1; }
+      .t     { font-size: 12.5px; fill: #111; text-anchor: middle; }
+      .tb    { font-size: 13px; font-weight: bold; fill: #111; text-anchor: middle; }
+      .ts    { font-size: 11.5px; fill: #333; text-anchor: middle; }
+      .note  { font-size: 11.5px; font-style: italic; fill: #444; text-anchor: middle; }
+      .lbl   { font-size: 11px; font-style: italic; fill: #333; text-anchor: middle; }
+      .ln    { stroke: #333; stroke-width: 1.3; fill: none; marker-end: url(#ar); }
+      .dash  { stroke: #333; stroke-width: 1.1; fill: none; stroke-dasharray: 4 3; marker-end: url(#ar); }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1320" height="660" fill="#fff"/>
+
+  <!-- ================= Sources ================= -->
+  <rect class="box" x="20"  y="16" width="380" height="54" rx="4" fill="#f4f4f4"/>
+  <text class="tb" x="210" y="38">Manuscript (main.tex)</text>
+  <text class="ts" x="210" y="56">system model · methods · experiment design</text>
+
+  <rect class="box" x="470" y="16" width="380" height="54" rx="4" fill="#f4f4f4"/>
+  <text class="tb" x="660" y="38">Base papers</text>
+  <text class="ts" x="660" y="56">FP Part I &amp; II · DUFP · DeepFP · GNNFP</text>
+
+  <rect class="box" x="920" y="16" width="380" height="54" rx="4" fill="#f4f4f4"/>
+  <text class="tb" x="1110" y="38">Design specification</text>
+  <text class="ts" x="1110" y="56">math corrections · author decisions</text>
+
+  <path d="M210,70 V86 M660,70 V86 M1110,70 V86 M125,86 H1110" stroke="#333" stroke-width="1.3" fill="none"/>
+  <path class="ln" d="M125,86 V106"/>
+  <path class="ln" d="M385,86 V106"/>
+  <path class="ln" d="M665,86 V106"/>
+
+  <!-- ================= (1) Data generation ================= -->
+  <rect class="stage" x="20" y="108" width="210" height="412" rx="8" fill="#eef3fa"/>
+  <rect x="20" y="108" width="210" height="34" rx="8" fill="#cddcef" stroke="#555" stroke-width="1.2"/>
+  <text class="hdr" x="125" y="130">(1) Data generation</text>
+
+  <rect class="box" x="30" y="158" width="190" height="92" rx="4"/>
+  <text class="tb" x="125" y="178">Channel model</text>
+  <text class="t" x="125" y="197">2 IRSs × M-element ULA</text>
+  <text class="t" x="125" y="214">Rician (κ = 10) / Rayleigh</text>
+  <text class="t" x="125" y="231">PL + NLOS + 8 dB shadowing</text>
+
+  <path class="ln" d="M125,250 V266"/>
+  <rect class="box" x="30" y="268" width="190" height="58" rx="4"/>
+  <text class="tb" x="125" y="289">Single-surface association</text>
+  <text class="t" x="125" y="310">x<tspan baseline-shift="sub" font-size="9">k,n</tspan> = argmax<tspan baseline-shift="sub" font-size="9">n</tspan> ‖b<tspan baseline-shift="sub" font-size="9">k,n</tspan>‖</text>
+
+  <path class="ln" d="M125,326 V342"/>
+  <rect class="box" x="30" y="344" width="190" height="80" rx="4"/>
+  <text class="tb" x="125" y="365">Cached datasets</text>
+  <text class="t" x="125" y="384">train 10⁴ · val 10³ · test 10³</text>
+  <text class="t" x="125" y="401">+ 10³ per sweep point</text>
+  <text class="t" x="125" y="418">(M, K, CRN power)</text>
+
+  <text class="note" x="125" y="458">fixed seed registry,</text>
+  <text class="note" x="125" y="474">hash-validated cache</text>
+
+  <!-- ================= (2) FP-AO baseline ================= -->
+  <rect class="stage" x="280" y="108" width="210" height="412" rx="8" fill="#eef6ea"/>
+  <rect x="280" y="108" width="210" height="34" rx="8" fill="#d3e8c8" stroke="#555" stroke-width="1.2"/>
+  <text class="hdr" x="385" y="130">(2) FP-AO baseline</text>
+
+  <rect class="box" x="290" y="158" width="190" height="56" rx="4"/>
+  <text class="tb" x="385" y="179">FP transforms</text>
+  <text class="t" x="385" y="200">α = γ ,  β = ε (quadratic)</text>
+
+  <path class="ln" d="M385,214 V230"/>
+  <rect class="box" x="290" y="232" width="190" height="40" rx="4"/>
+  <text class="t" x="385" y="257">Closed-form power law</text>
+
+  <path class="ln" d="M385,272 V288"/>
+  <rect class="box" x="290" y="290" width="190" height="58" rx="4"/>
+  <text class="tb" x="385" y="311">MM phase step</text>
+  <text class="t" x="385" y="331">explicit O(M³) | efficient</text>
+
+  <path class="ln" d="M385,348 V364"/>
+  <rect class="box" x="290" y="366" width="190" height="56" rx="4"/>
+  <text class="tb" x="385" y="387">Sanity check (val)</text>
+  <text class="t" x="385" y="407">full AO vs power-only ≥ 10 %</text>
+
+  <path class="ln" d="M385,422 V438"/>
+  <rect class="box" x="290" y="440" width="190" height="62" rx="4" fill="#f7fbf4"/>
+  <text class="tb" x="385" y="462">Teacher labels Φ*</text>
+  <text class="t" x="385" y="482">AO-100 (+ AO-1000 ref.)</text>
+
+  <!-- AO iteration loop (right gap) -->
+  <path class="dash" d="M480,319 H500 V186 H482"/>
+  <text class="lbl" x="516" y="252" transform="rotate(90 516 252)">until ΔR/R &lt; 10⁻⁵ or 100 it.</text>
+
+  <!-- ================= (3) Unfolded architectures ================= -->
+  <rect class="stage" x="540" y="108" width="250" height="412" rx="8" fill="#fdf1ea"/>
+  <rect x="540" y="108" width="250" height="34" rx="8" fill="#f6d5c1" stroke="#555" stroke-width="1.2"/>
+  <text class="hdr" x="665" y="130">(3) Unfolded architectures</text>
+
+  <rect class="box" x="550" y="158" width="230" height="56" rx="4"/>
+  <text class="tb" x="665" y="179">Shared deterministic block</text>
+  <text class="t" x="665" y="200">α, β/ε, power law (no parameters)</text>
+
+  <path class="ln" d="M585,214 V242"/>
+  <path class="ln" d="M665,214 V242"/>
+  <path class="ln" d="M745,214 V242"/>
+
+  <rect class="box" x="550" y="244" width="70" height="104" rx="4"/>
+  <text class="tb" x="585" y="264">FONR</text>
+  <text class="ts" x="585" y="284">T = 3</text>
+  <text class="ts" x="585" y="299">θ-steps,</text>
+  <text class="ts" x="585" y="314">learned</text>
+  <text class="ts" x="585" y="329">scalar μ</text>
+
+  <rect class="box" x="630" y="244" width="70" height="104" rx="4"/>
+  <text class="tb" x="665" y="264">MASO</text>
+  <text class="ts" x="665" y="284">MLP</text>
+  <text class="ts" x="665" y="299">precond.,</text>
+  <text class="ts" x="665" y="314">Riemann.</text>
+  <text class="ts" x="665" y="329">gradient</text>
+
+  <rect class="box" x="710" y="244" width="70" height="104" rx="4"/>
+  <text class="tb" x="745" y="264">TIAS</text>
+  <text class="ts" x="745" y="284">bipartite</text>
+  <text class="ts" x="745" y="299">GNN,</text>
+  <text class="ts" x="745" y="314">shared</text>
+  <text class="ts" x="745" y="329">node MLP</text>
+
+  <path class="ln" d="M585,348 V370"/>
+  <path class="ln" d="M665,348 V370"/>
+  <path class="ln" d="M745,348 V370"/>
+
+  <rect class="box" x="550" y="372" width="230" height="44" rx="4"/>
+  <text class="t" x="665" y="399">Unit-modulus retraction  |φ<tspan baseline-shift="sub" font-size="9">n,m</tspan>| = 1</text>
+
+  <text class="note" x="665" y="446">matrix-free gradient g = v − Aφ,</text>
+  <text class="note" x="665" y="462">no M×M inversion;</text>
+  <text class="note" x="665" y="486">same initial state (p⁰, Φ⁰) as FP-AO</text>
+
+  <!-- unfolding loop (right gap) -->
+  <path class="dash" d="M780,394 H800 V186 H782"/>
+  <text class="lbl" x="814" y="290" transform="rotate(90 814 290)">layers l = 1 … L (L = 10)</text>
+
+  <!-- ================= (4) Hybrid training ================= -->
+  <rect class="stage" x="840" y="108" width="210" height="412" rx="8" fill="#f3effa"/>
+  <rect x="840" y="108" width="210" height="34" rx="8" fill="#ddd2ef" stroke="#555" stroke-width="1.2"/>
+  <text class="hdr" x="945" y="130">(4) Hybrid training</text>
+
+  <rect class="box" x="850" y="158" width="190" height="56" rx="4"/>
+  <text class="tb" x="945" y="179">LR pilot</text>
+  <text class="t" x="945" y="200">{0.1, 0.01, 0.001}, val only</text>
+
+  <path class="ln" d="M945,214 V230"/>
+  <rect class="box" x="850" y="232" width="190" height="58" rx="4"/>
+  <text class="tb" x="945" y="253">Stage I: supervised</text>
+  <text class="t" x="945" y="273">phase alignment (ep. 1–50)</text>
+
+  <path class="ln" d="M945,290 V306"/>
+  <rect class="box" x="850" y="308" width="190" height="74" rx="4"/>
+  <text class="tb" x="945" y="329">Stage II: unsupervised</text>
+  <text class="t" x="945" y="348">deep supervision</text>
+  <text class="t" x="945" y="366">−½R − ½f<tspan baseline-shift="sub" font-size="9">q</tspan>  (ep. 51–200)</text>
+
+  <path class="ln" d="M945,382 V398"/>
+  <rect class="box" x="850" y="400" width="190" height="56" rx="4" fill="#faf8fd"/>
+  <text class="tb" x="945" y="421">Checkpoints</text>
+  <text class="t" x="945" y="441">best.pt / last.pt, exact resume</text>
+
+  <text class="note" x="945" y="484">GPU, complex64,</text>
+  <text class="note" x="945" y="500">grad-norm clip 1.0</text>
+
+  <!-- ================= (5) Evaluation ================= -->
+  <rect class="stage" x="1100" y="108" width="210" height="412" rx="8" fill="#fdf8e8"/>
+  <rect x="1100" y="108" width="210" height="34" rx="8" fill="#f5e6b3" stroke="#555" stroke-width="1.2"/>
+  <text class="hdr" x="1205" y="130">(5) Evaluation</text>
+
+  <rect class="box" x="1110" y="158" width="190" height="54" rx="4"/>
+  <text class="tb" x="1205" y="178">Fig. 1–3</text>
+  <text class="t" x="1205" y="198">convergence · wall-clock · CDF</text>
+
+  <rect class="box" x="1110" y="222" width="190" height="54" rx="4"/>
+  <text class="tb" x="1205" y="242">Fig. 4, 7</text>
+  <text class="t" x="1205" y="262">runtime vs M, K (fair CPU)</text>
+
+  <rect class="box" x="1110" y="286" width="190" height="54" rx="4"/>
+  <text class="tb" x="1205" y="306">Fig. 5</text>
+  <text class="t" x="1205" y="326">efficiency η vs CRN power</text>
+
+  <rect class="box" x="1110" y="350" width="190" height="54" rx="4"/>
+  <text class="tb" x="1205" y="370">Fig. 6, 8</text>
+  <text class="t" x="1205" y="390">zero-shot K and M</text>
+
+  <rect class="box" x="1110" y="414" width="190" height="40" rx="4"/>
+  <text class="t" x="1205" y="439">GPU timing (supplement)</text>
+
+  <text class="note" x="1205" y="484">trained once at M = 80, K = 6;</text>
+  <text class="note" x="1205" y="500">no retraining across sweeps</text>
+
+  <!-- ================= Inter-stage flow ================= -->
+  <!-- channels to FP-AO -->
+  <path class="ln" d="M220,384 H250 V186 H288"/>
+  <text class="lbl" x="250" y="176">CSI</text>
+
+  <!-- networks to training -->
+  <path class="ln" d="M790,125 H838"/>
+  <text class="lbl" x="814" y="118">θ</text>
+
+  <!-- checkpoints to evaluation -->
+  <path class="ln" d="M1040,428 H1066 V185 H1108"/>
+  <text class="lbl" x="1066" y="175">best.pt</text>
+
+  <!-- teacher labels to Stage I (supervision) -->
+  <path class="ln" d="M480,471 H520 V536 H826 V261 H848"/>
+  <text class="lbl" x="673" y="550">teacher labels Φ* (Stage I supervision)</text>
+
+  <!-- AO reference to evaluation -->
+  <path class="dash" d="M520,536 V566 H1086 V200 H1108"/>
+  <text class="lbl" x="800" y="580">FP-AO reference (AO-100, AO-1000) for all comparisons</text>
+
+  <!-- ================= Outputs ================= -->
+  <path class="ln" d="M1205,520 V600"/>
+  <path class="ln" d="M1205,586 H1050 V600"/>
+  <rect class="box" x="870" y="602" width="200" height="50" rx="4" fill="#f4f4f4"/>
+  <text class="tb" x="970" y="622">Paper figures</text>
+  <text class="t" x="970" y="640">8 × (PNG 300 dpi + PDF)</text>
+
+  <rect class="box" x="1110" y="602" width="200" height="50" rx="4" fill="#f4f4f4"/>
+  <text class="tb" x="1210" y="622">results_findings.md</text>
+  <text class="t" x="1210" y="640">claims vs measured · deviations</text>
+</svg>
