@@ -6,10 +6,12 @@ checkpoints), ``evaluate`` (no-grad, default complex128/CPU), ``final_metrics``.
 Loss section
 ------------
 * ``loss_supervised``      Stage I phase alignment, mean_{B,N,M} (1 - Re{phi^(L) conj(phi*)}).
-* ``loss_unsup_layer``     Stage II composite mean_B[-a R_nats - (1-a) f3] at one layer's output.
+* ``loss_unsup_layer``     Stage II composite mean_B[-a R_nats - (1-a) f_q] at one layer's output.
+  f_q = sum_k w_k (ln(1+alpha_k) - alpha_k) + f3: the detached constant turns f3 into the Shen-Yu
+  lower bound of the ln-WSR (value ~ ln-WSR, = ln-WSR at alpha = gamma; gradients unchanged).
   Inside f3, wt = w(1 + alpha_in) uses the alpha the layer actually used (its INPUT-state
   alpha), DETACHED; eps is recomputed in closed form from the output (p_l, phi_l) with
-  gradients flowing through it. Both terms are in nats.
+  gradients flowing through it. Both terms are in nats; the loss is negative by construction.
 * ``loss_deep_supervision`` sum_{l=1..L} rho_l loss_unsup_layer(layer-l output), rho_l = l / sum_j j.
 """
 from __future__ import annotations
@@ -42,16 +44,31 @@ def loss_supervised(phi_L: torch.Tensor, phi_star: torch.Tensor) -> torch.Tensor
     return (1.0 - (phi_L * phi_star.conj()).real).mean()
 
 
-def loss_unsup_layer(ch: ChannelBatch, p_l: torch.Tensor, phi_l: torch.Tensor,
-                     alpha_in_l: torch.Tensor, a: float = 0.5) -> torch.Tensor:
-    """mean_B[-a R_nats - (1-a) f3] with detached input-state alpha and closed-form eps."""
-    wt = ch.w * (1 + alpha_in_l.detach())
+def loss_unsup_terms(ch: ChannelBatch, p_l: torch.Tensor, phi_l: torch.Tensor,
+                     alpha_in_l: torch.Tensor) -> tuple:
+    """(R_nats, f_q), each (B,), at one layer's output (p_l, phi_l).
+
+    f_q = sum_k w_k (ln(1+alpha_k) - alpha_k) + f3(p_l, phi_l; wt, eps*) with alpha = alpha_in_l DETACHED
+    (the constant has no gradient) and eps* = sqrt(wt p) H / D closed-form at the output (gradients flow).
+    f_q is the Shen-Yu lower bound of the ln-WSR; it equals R_nats at alpha = gamma(p_l, phi_l).
+    H and D are computed once and shared by f3 and R."""
+    alpha = alpha_in_l.detach()
+    wt = ch.w * (1 + alpha)
     H = fp.effective_channel(ch, phi_l)
     D = fp.received_power(ch, p_l, H)
     eps = fp.safe_sqrt(wt * p_l) * H / D[:, None]          # grads flow through p_l, phi_l
-    f3 = fp.surrogate_f3(ch, p_l, phi_l, wt, eps)
-    R = fp.wsr(ch, p_l, phi_l, base="e")
-    return (-a * R - (1 - a) * f3).mean()
+    const = (ch.w * (torch.log1p(alpha) - alpha)).sum(-1)
+    fq = const + fp.surrogate_f3(ch, p_l, phi_l, wt, eps, H=H, D=D)
+    R = fp.wsr(ch, p_l, phi_l, base="e", H=H, D=D)
+    return R, fq
+
+
+def loss_unsup_layer(ch: ChannelBatch, p_l: torch.Tensor, phi_l: torch.Tensor,
+                     alpha_in_l: torch.Tensor, a: float = 0.5) -> torch.Tensor:
+    """mean_B[-a R_nats - (1-a) f_q] (see loss_unsup_terms). Negative by construction: we minimise
+    the negative of a (lower bound of the) ln-WSR; at alpha = gamma it equals -mean(R_nats)."""
+    R, fq = loss_unsup_terms(ch, p_l, phi_l, alpha_in_l)
+    return (-a * R - (1 - a) * fq).mean()
 
 
 def rho_weights(L: int, dtype=torch.float64, device=None) -> torch.Tensor:
@@ -60,27 +77,43 @@ def rho_weights(L: int, dtype=torch.float64, device=None) -> torch.Tensor:
     return l / l.sum()
 
 
-def loss_deep_supervision(ch: ChannelBatch, traj: Trajectory, a: float = 0.5) -> torch.Tensor:
-    """sum_{l=1..L} rho_l loss_unsup_layer(ch, traj.p[l], traj.phi[l], traj.alpha_in[l-1], a)."""
+def loss_deep_supervision(ch: ChannelBatch, traj: Trajectory, a: float = 0.5, terms: bool = False):
+    """sum_{l=1..L} rho_l loss_unsup_layer(ch, traj.p[l], traj.phi[l], traj.alpha_in[l-1], a).
+
+    ``terms=True`` returns (total, R_term, fq_term) with R_term = sum_l rho_l mean_B R_nats(l) and
+    fq_term = sum_l rho_l mean_B f_q(l), so total = -a R_term - (1-a) fq_term (all 0-dim tensors)."""
     L = traj.alpha_in.shape[0]
     rho = rho_weights(L, dtype=traj.p.dtype, device=traj.p.device)
     total = traj.p.new_zeros(())
+    r_term = traj.p.new_zeros(())
+    fq_term = traj.p.new_zeros(())
     for l in range(1, L + 1):  # loop over layers (allowed)
-        total = total + rho[l - 1] * loss_unsup_layer(ch, traj.p[l], traj.phi[l], traj.alpha_in[l - 1], a)
-    return total
+        R, fq = loss_unsup_terms(ch, traj.p[l], traj.phi[l], traj.alpha_in[l - 1])
+        total = total + rho[l - 1] * (-a * R - (1 - a) * fq).mean()
+        if terms:
+            r_term = r_term + rho[l - 1] * R.detach().mean()
+            fq_term = fq_term + rho[l - 1] * fq.detach().mean()
+    return (total, r_term, fq_term) if terms else total
 
 
 # ================================================================ training loop (spec §8)
 # ao_tol / ao_max_iter: the AO rule defines the teacher labels (Stage I targets), so changing the cap must
 # invalidate LR pilots and checkpoints too.
 TRAIN_KEYS = data.CHANNEL_KEYS + ("N", "M", "K", "L", "T", "ao_tol", "ao_max_iter", "n_train", "n_sup_epochs",
-                                  "n_unsup_epochs", "batch_size", "lr_grid", "loss_a", "maso_M_train", "tias_hidden",
+                                  "n_unsup_epochs", "batch_size", "lr_grid", "loss_a", "loss_version", "maso_M_train", "tias_hidden",
                                   "grad_clip_norm")
 PILOT_KEYS = TRAIN_KEYS + ("pilot_sup_epochs", "pilot_unsup_epochs")
 
+# Per-epoch history CSV {model}_training_history.csv: spec §8 columns, then n_skipped_batches (controller
+# ruling) and the two Stage-II loss components (Task 16 ruling), epoch means over the non-skipped batches:
+#   train_wsr_nats_term = sum_l rho_l mean_B R_nats(layer l)   (ln-WSR, nats)
+#   train_fq_term       = sum_l rho_l mean_B f_q(layer l)      (Shen-Yu lower bound of the ln-WSR, nats)
+# so that in Stage II train_loss = -a*train_wsr_nats_term - (1-a)*train_fq_term. Both are NaN in Stage I.
+# The Stage-II loss is NEGATIVE BY CONSTRUCTION: training minimises the negative of a (bound on the)
+# ln-WSR, so train_loss/val_loss ~ -(WSR in nats) and lower is better.
 HISTORY_COLS = ["epoch", "stage", "lr", "train_loss", "val_loss", "train_wsr_mean", "train_wsr_std",
                 "val_wsr_mean", "val_wsr_std", "val_phase_cosine_sim", "is_best", "epoch_time_sec",
-                "n_skipped_batches"]  # spec §8 columns + one trailing column (controller ruling)
+                "n_skipped_batches", "train_wsr_nats_term", "train_fq_term"]
 PILOT_COLS = ["lr", "epoch", "stage", "val_wsr_mean"]
 FINAL_COLS = (["model_name", "selected_lr", "best_epoch"]
               + [f"{s}_{c}" for s in ("train", "val", "test")
@@ -215,15 +248,16 @@ def _train_epoch(model, opt, D: _Data, cfg: Config, epoch: int, n_sup: int) -> d
     model.train()
     gen = torch.Generator().manual_seed(seed_for("train") + epoch)
     perm = torch.randperm(D.B, generator=gen)
-    losses, means, stds, n_skip = [], [], [], 0
+    losses, means, stds, rts, fqs, n_skip = [], [], [], [], [], 0
     for lo in range(0, D.B, cfg.batch_size):
         idx = perm[lo:lo + cfg.batch_size].to(D.device)
         c = D.ch.slice(idx)
         tr = model(c, D.p0[idx], D.phi0[idx])
         if epoch <= n_sup:
             loss = loss_supervised(tr.phi[-1], D.phi_star[idx])
+            rt = fq = None
         else:
-            loss = loss_deep_supervision(c, tr, cfg.loss_a)
+            loss, rt, fq = loss_deep_supervision(c, tr, cfg.loss_a, terms=True)
         skipped = _optimizer_step(model, opt, loss, cfg.grad_clip_norm)
         n_skip += skipped
         if skipped:
@@ -233,10 +267,13 @@ def _train_epoch(model, opt, D: _Data, cfg: Config, epoch: int, n_sup: int) -> d
         losses.append(loss.item())
         means.append(float(w.mean()))
         stds.append(float(w.std()) if w.numel() > 1 else 0.0)
+        rts.append(float("nan") if rt is None else float(rt))
+        fqs.append(float("nan") if fq is None else float(fq))
     nb = len(losses)
     avg = (lambda v: sum(v) / nb) if nb else (lambda v: float("nan"))
     return {"train_loss": avg(losses), "train_wsr_mean": avg(means),
-            "train_wsr_std": avg(stds), "n_skipped_batches": int(n_skip)}
+            "train_wsr_std": avg(stds), "n_skipped_batches": int(n_skip),
+            "train_wsr_nats_term": avg(rts), "train_fq_term": avg(fqs)}
 
 
 def _val(model, D: _Data, cfg: Config) -> dict:

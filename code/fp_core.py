@@ -96,10 +96,15 @@ def safe_sqrt(x: torch.Tensor) -> torch.Tensor:
     return _SafeSqrt.apply(x)
 
 
-def wsr(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor, base: str = "2") -> torch.Tensor:
-    """Weighted sum rate (B,); base "2" gives bits, base "e" gives nats."""
-    H = effective_channel(ch, phi)
-    r = (ch.w * torch.log1p(sinr(p, H, received_power(ch, p, H), ch.sigma2))).sum(-1)
+def wsr(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor, base: str = "2",
+        H: torch.Tensor | None = None, D: torch.Tensor | None = None) -> torch.Tensor:
+    """Weighted sum rate (B,); base "2" gives bits, base "e" gives nats. ``H``/``D`` may be passed in
+    when already computed at (p, phi) (identical values, saves the recomputation)."""
+    if H is None:
+        H = effective_channel(ch, phi)
+    if D is None:
+        D = received_power(ch, p, H)
+    r = (ch.w * torch.log1p(sinr(p, H, D, ch.sigma2))).sum(-1)
     if base == "e":
         return r
     if base == "2":
@@ -134,10 +139,14 @@ def power_update(ch: ChannelBatch, aux: Aux, p_cur: torch.Tensor) -> torch.Tenso
 
 
 def surrogate_f3(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor,
-                 wt: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
-    """f3 = sum_k 2Re{eps_k* sqrt(wt_k p_k) H_k} - Xi D, Xi from ``eps``  -> (B,)."""
-    H = effective_channel(ch, phi)
-    D = received_power(ch, p, H)
+                 wt: torch.Tensor, eps: torch.Tensor,
+                 H: torch.Tensor | None = None, D: torch.Tensor | None = None) -> torch.Tensor:
+    """f3 = sum_k 2Re{eps_k* sqrt(wt_k p_k) H_k} - Xi D, Xi from ``eps``  -> (B,).
+    ``H``/``D`` at (p, phi) may be passed in (identical values)."""
+    if H is None:
+        H = effective_channel(ch, phi)
+    if D is None:
+        D = received_power(ch, p, H)
     Xi = (eps.abs() ** 2).sum(-1)
     return 2 * (eps.conj() * safe_sqrt(wt * p) * H).real.sum(-1) - Xi * D
 

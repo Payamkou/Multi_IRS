@@ -38,6 +38,7 @@ class Config:
     pilot_sup_epochs: int = 5
     pilot_unsup_epochs: int = 15
     loss_a: float = 0.5
+    loss_version: int = 2   # 2 = Stage-II f_q term (Task 16); bumping it invalidates pilots/checkpoints/results
     grad_clip_norm: float = 1.0
     maso_M_train: int = 80
     tias_hidden: int = 32

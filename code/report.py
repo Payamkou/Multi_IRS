@@ -1175,6 +1175,14 @@ DEVIATIONS = [
               "Prevents an untuned-model strawman without favouring any model.",
               evidence_fn=_ev_lr,
               suggestion="Table I / Sec. VI-A: report the per-model LR (see Sec. 5)."),
+    Deviation("loss_fq", "Stage-II loss uses the f_q form of f₃ (value only)", "Sec. V (hybrid loss)", "IV",
+              "The f₃ term of −a·R − (1−a)·f₃ carries the detached constant Σ_k w_k(ln(1+α_k) − α_k), so it equals "
+              "the Shen–Yu lower bound f_q of the ln-WSR (= ln-WSR at α = γ). Gradients are unchanged. The loss is "
+              "negative by construction (it minimises −objective, in nats); the history CSVs log its two components "
+              "(train_wsr_nats_term, train_fq_term).",
+              "Without the constant the f₃ value is ≈ the weighted sum-SINR (e.g. −80 for TIAS while the WSR was "
+              "4.4 bits), which made the logged loss uninterpretable; the training signal is identical.",
+              ""),
     Deviation("complex64", "complex64 GPU training; complex128 evaluation", "Sec. VI-A (not specified)", "VI",
               "Training runs in complex64 on the GPU; AO, teacher labels, every evaluation and CPU timing use "
               "complex128.",

@@ -10,6 +10,7 @@ import fp_core as fp
 from channels import generate_channels
 from config import Config
 from models.fonr import FONR
+import train
 from train import loss_deep_supervision, loss_supervised, loss_unsup_layer, rho_weights
 
 C128, F64 = torch.complex128, torch.float64
@@ -60,14 +61,49 @@ def test_unsup_nats():
     assert float(got) == pytest.approx(float(want), rel=1e-12)
 
 
-def test_unsup_f3_equals_ln_wsr_at_alpha_gamma():
-    """Composite = mean(-a R_nats - (1-a) f3), eps closed-form at the given state."""
+def test_unsup_fq_equals_ln_wsr_at_alpha_gamma():
+    """Task 16 A: f_q = sum w (ln(1+alpha) - alpha) + f3 equals the ln-WSR at alpha = gamma, so the
+    composite is mean(-a R - (1-a) f_q) = -mean(R_nats) there."""
     ch, p, phi = _make()
     aux = fp.aux_vars(ch, p, phi)
-    f3 = fp.surrogate_f3(ch, p, phi, aux.wt, aux.eps)
+    R, fq = train.loss_unsup_terms(ch, p, phi, aux.alpha)
+    want = fp.wsr(ch, p, phi, base="e")
+    assert torch.allclose(fq, want, rtol=1e-10, atol=0)
+    assert torch.allclose(R, want, rtol=1e-12, atol=0)
     got = loss_unsup_layer(ch, p, phi, aux.alpha, a=0.25)
-    want = (-0.25 * fp.wsr(ch, p, phi, base="e") - 0.75 * f3).mean()
-    assert float(got) == pytest.approx(float(want), rel=1e-12)
+    assert float(got) == pytest.approx(float(-want.mean()), rel=1e-10)
+    f3 = fp.surrogate_f3(ch, p, phi, aux.wt, aux.eps)
+    const = (ch.w * (torch.log1p(aux.alpha) - aux.alpha)).sum(-1)
+    assert torch.allclose(fq, const + f3, rtol=1e-12, atol=0)
+
+
+def test_unsup_fq_gradient_equals_old_f3_gradient():
+    """The added constant is detached: d f_q / d phi == d f3 / d phi (old term), alpha != gamma too."""
+    ch, p0, phi0 = _make()
+    alpha = fp.aux_vars(ch, p0, phi0).alpha
+    phi1 = phi0 * torch.exp(0.3j * torch.ones_like(phi0.real))   # state != the one alpha came from
+    for a_in in (fp.aux_vars(ch, p0, phi1).alpha, alpha):
+        phi_a = phi1.clone().requires_grad_(True)
+        _, fq = train.loss_unsup_terms(ch, p0, phi_a, a_in)
+        fq.sum().backward()
+        phi_b = phi1.clone().requires_grad_(True)
+        wt = ch.w * (1 + a_in)
+        H = fp.effective_channel(ch, phi_b)
+        D = fp.received_power(ch, p0, H)
+        eps = fp.safe_sqrt(wt * p0) * H / D[:, None]
+        fp.surrogate_f3(ch, p0, phi_b, wt, eps).sum().backward()
+        assert torch.allclose(phi_a.grad, phi_b.grad, rtol=1e-10, atol=0)
+
+
+def test_deep_supervision_terms():
+    ch, p0, phi0 = _make()
+    net = FONR(L=10, T=3, mu_init=1e-3)
+    with torch.no_grad():
+        tr = net(ch, p0, phi0)
+        total, r_term, fq_term = loss_deep_supervision(ch, tr, a=0.5, terms=True)
+        assert float(total) == pytest.approx(float(loss_deep_supervision(ch, tr, a=0.5)), rel=1e-12)
+        assert float(total) == pytest.approx(-0.5 * float(r_term) - 0.5 * float(fq_term), rel=1e-12)
+        assert float(r_term) > 0 and float(fq_term) <= float(r_term) + 1e-9   # f_q is a lower bound
 
 
 def test_rho_weights_sum_to_one():
@@ -114,7 +150,7 @@ import train
 
 HIST_COLS = ["epoch", "stage", "lr", "train_loss", "val_loss", "train_wsr_mean", "train_wsr_std",
              "val_wsr_mean", "val_wsr_std", "val_phase_cosine_sim", "is_best", "epoch_time_sec",
-             "n_skipped_batches"]
+             "n_skipped_batches", "train_wsr_nats_term", "train_fq_term"]
 
 
 def _tiny_cfg(root, **kw):
@@ -384,4 +420,12 @@ def test_ao_cap_in_train_and_pilot_keys():
         assert k in train.TRAIN_KEYS and k in train.PILOT_KEYS
     a, b = Config(ao_max_iter=100), dataclasses.replace(Config(), ao_max_iter=1000)
     assert config_hash(a, train.TRAIN_KEYS) != config_hash(b, train.TRAIN_KEYS)
+    assert config_hash(a, train.PILOT_KEYS) != config_hash(b, train.PILOT_KEYS)
+
+
+def test_loss_version_invalidates_old_runs():
+    """Task 16 A: the f_q loss change bumps loss_version, which is part of every training hash."""
+    from config import config_hash
+    assert Config().loss_version == 2 and "loss_version" in train.TRAIN_KEYS
+    a, b = Config(), dataclasses.replace(Config(), loss_version=1)
     assert config_hash(a, train.PILOT_KEYS) != config_hash(b, train.PILOT_KEYS)
