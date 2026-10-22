@@ -158,13 +158,16 @@ p_k ← min{ P_k, w̃_k (max(0, Re{β_k* H_k}))² / (|H_k|² Σ_i |β_i|²)² }.
 
 ### 6.1 FP-AO (baseline and teacher)
 
-One iteration, in main.tex Algorithm 1's order:
-1. compute α, β and ε (β ≡ ε) from the current (p, Φ);
+One iteration:
+1. compute α (and so w̃), β and ε from the current (p, Φ);
 2. update p by the power law;
-3. update each φ_n with that same ε;
-4. recompute R and stop when ΔR/R < 10⁻⁵ or after 100 iterations (Table I).
+3. **refresh ε, Ξ, H and D using the new p**, keeping α and w̃ from step 1;
+4. update each φ_n using that refreshed ε;
+5. recompute R and stop when ΔR/R < 10⁻⁵ or after 100 iterations (Table I).
 
-This order is a valid block ascent. f₂ and f₃ are the same function f(p, Φ, y); with y fixed, the p step and the Φ step can each only increase it, and refreshing y then closes the bound. Recomputing ε after the power update would give a slightly tighter bound, but it isn't needed, so we keep the paper's order and there is nothing to correct here.
+**Deviation from main.tex Algorithm 1 (decided during implementation).** main.tex computes ε before the power update and reuses it for the phase step. That order is a valid block ascent, but it is degenerate in practice. Substituting the closed-form p into c_k = √(w̃_k p_k)ε_k − Ξ p_k H_k gives c_k = 0 exactly for every user whose power is not clipped at P_peak. Measured on 200 default samples, the median |c_k| for unclipped users was about 3·10⁻²⁰, against 0.026 for clipped users. So about 69% of users would contribute nothing to the phase gradient, which weakens AO and all three networks.
+
+Refreshing ε after the power update keeps the alternating ascent valid and gives a tighter bound; it follows Shen–Yu's principle of making each auxiliary variable optimal before each primal block. This change is implemented once, in the shared deterministic block, so it applies identically to FP-AO, FONR, MASO and TIAS. The findings report lists it.
 
 **Phase step (decided, D1):** a majorisation–minimisation step using the nonhomogeneous bound from DeepFP Lemma 1 (Shen et al.'s FastFP). Because |φ_m| = 1, φᴴφ = M is constant, which gives the exact closed form
 φ_n ← exp(j·∠( v_n + (λ_n I − A_n) φ_n )), with λ_n = λ_max(A_n).
