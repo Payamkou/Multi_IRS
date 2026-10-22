@@ -137,8 +137,7 @@ def _sample_times(stepper, d, idx, cfg, device, cdtype) -> np.ndarray:
     On CUDA only, a sample whose step raises ``torch.linalg.LinAlgError`` (cuSOLVER eigvalsh in
     complex64 can fail on an ill-conditioned A_n in explicit AO) is recorded as NaN; on CPU it raises."""
     out = np.empty(len(idx))
-    desc = f"  {getattr(stepper, 'mode', type(stepper).__name__)} {torch.device(device).type}"
-    for j, i in enumerate(runlog.bar(idx, desc=desc, unit="sample", leave=False, mininterval=5.0)):
+    for j, i in enumerate(idx):   # no inner bar: text bars cannot nest in a notebook (outer bar = points)
         try:
             out[j] = timing.time_steps(stepper, d["ch"].slice([int(i)]), d["theta0"][[int(i)]], cfg.L,
                                        device, cdtype, warmup=cfg.timing_warmup).mean()
@@ -175,7 +174,9 @@ def _cached_points(cfg, stem, labels, keys, files_of, extra, compute, force) -> 
     os.makedirs(os.path.join(cfg.root, "results", POINT_DIR), exist_ok=True)
     base = artifact_fingerprint(cfg)
     out = {}
-    for lab in runlog.bar(labels, desc=stem, unit="point"):
+    pbar = runlog.bar(labels, desc=stem, unit="point")
+    for lab in pbar:
+        pbar.set_postfix(point=lab)
         p = point_path(cfg, stem, lab)
         fpr = extend_fingerprint(cfg, base, files_of(lab))
         if force or not check_cache(p, cfg, keys, fpr, extra):
@@ -552,13 +553,12 @@ def _gpu_steps_point(cfg, device, cdtype, nets) -> dict:
         out[f"step_time_{n}"] = np.stack([
             timing.time_steps(net, d["ch"].slice([int(i)]), d["theta0"][[int(i)]], net.L, device, cdtype,
                               warmup=cfg.timing_warmup)
-            for i in runlog.bar(idx, desc=f"  gpu steps {n}", unit="sample", leave=False, mininterval=5.0)])
+            for i in idx])
         log.info("gpu step timing %s: %.4f ms/layer", n, 1e3 * out[f"step_time_{n}"].mean())
     for mode in AO_MODES:
         st = ao.AOStepper(mode)
         runs = []
-        for i in runlog.bar(idx, desc=f"  gpu AO {mode} to convergence", unit="sample", leave=False,
-                            mininterval=5.0):
+        for i in idx:
             try:
                 runs.append(timing.time_until_converged(st, d["ch"].slice([int(i)]), d["theta0"][[int(i)]],
                                                         cfg.ao_tol, cfg.ao_max_iter, device, cdtype)[0])

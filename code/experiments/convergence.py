@@ -189,7 +189,8 @@ def run_convergence(cfg: Config, force_rerun: bool = False) -> Path:
     log = runlog.get_logger(cfg, "exp01")
     for n, m in runlog.bar(list(models.items()), desc="exp01 WSR per layer", unit="model"):
         out[f"wsr_{n}"] = _wsr_per_layer(m, ch, theta0, cfg.eval_device)
-        log.info("%s WSR per layer: %s", n, np.round(out[f"wsr_{n}"].mean(0), 4))
+        log.info("%s WSR per layer: %s", n, np.array2string(out[f"wsr_{n}"].mean(0), precision=4,
+                                                               max_line_width=10 ** 6))
 
     idx = _timing_idx(cfg)
     prev = torch.get_num_threads()
@@ -201,13 +202,13 @@ def run_convergence(cfg: Config, force_rerun: bool = False) -> Path:
             out[f"time_{n}"] = np.stack([
                 timing.time_steps(net, ch.slice([i]), theta0[[i]], net.L, "cpu", C128,
                                   warmup=cfg.timing_warmup)
-                for i in runlog.bar(idx, desc=f"exp01 timing {n}", unit="sample", leave=False)])
+                for i in runlog.bar(idx, desc=f"exp01 timing {n}", unit="sample")])
             log.info("%s time/layer %.4f ms (%d samples)", n, 1e3 * out[f"time_{n}"].mean(), len(idx))
         for mode in AO_MODES:
             st = ao.AOStepper(mode)
             runs = [timing.time_until_converged(st, ch.slice([i]), theta0[[i]], cfg.ao_tol,
                                                 cfg.ao_max_iter, "cpu", C128)
-                    for i in runlog.bar(idx, desc=f"exp01 timing AO {mode}", unit="sample", leave=False)]
+                    for i in runlog.bar(idx, desc=f"exp01 timing AO {mode}", unit="sample")]
             T = max(len(r[0]) for r in runs)
             cum = np.empty((len(idx), T + 1))
             wt = np.empty((len(idx), T + 1))

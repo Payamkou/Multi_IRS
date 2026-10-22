@@ -73,10 +73,10 @@ def close_logger() -> None:
 
 
 def bar(iterable=None, **kw):
-    """Classic tqdm text bar with pipeline defaults (stderr, fixed width, >= 1 s between redraws,
+    """Classic tqdm text bar with pipeline defaults (stdout, fixed width, >= 1 s between redraws,
     so a notebook executed by nbconvert stores few updates)."""
     kw.setdefault("ncols", 110)
     kw.setdefault("mininterval", 1.0)
-    kw.setdefault("file", sys.stderr)
+    kw.setdefault("file", sys.stdout)   # same stream as the log lines: one coherent output per cell
     kw.setdefault("leave", True)
     return tqdm(iterable, **kw)
