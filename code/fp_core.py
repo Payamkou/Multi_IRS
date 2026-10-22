@@ -45,7 +45,6 @@ class Aux:
     Xi: torch.Tensor     # (B,)  sum_k |eps_k|^2
     H: torch.Tensor      # (B,K) complex effective channel at the state aux was built from
     D: torch.Tensor      # (B,)  total received power + sigma^2
-    # From deterministic_block: alpha/wt at the input (p, phi); eps/Xi/H/D at (p_new, phi).
 
 
 # ---------------------------------------------------------------- system model
@@ -113,24 +112,9 @@ def surrogate_f3(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor,
 
 
 def deterministic_block(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor):
-    """Spec §6.1 steps 1-3. Returns (p_new, aux).
-
-    1. alpha, wt, eps from the INPUT state (p, phi); p_new = power law.
-    2. eps, Xi, H, D are then REFRESHED at (p_new, phi), keeping alpha and wt
-       from the input state: D = D(p_new), eps = sqrt(wt p_new) H / D, Xi = sum|eps|^2.
-
-    So ``aux.alpha`` / ``aux.wt`` describe the input state (what the loss records as
-    alpha_in), while ``aux.eps``, ``aux.Xi``, ``aux.H``, ``aux.D`` describe (p_new, phi)
-    and feed the phase step. Reusing the input-state eps instead makes
-    c_k = sqrt(wt p_new) eps_k - Xi p_new H_k vanish for every unclipped user.
-    """
-    aux0 = aux_vars(ch, p, phi)
-    p_new = power_update(ch, aux0, p)
-    H = aux0.H                                   # phi unchanged
-    D = received_power(ch, p_new, H)
-    eps = torch.sqrt(aux0.wt * p_new) * H / D.unsqueeze(-1)
-    Xi = (eps.abs() ** 2).sum(-1)
-    return p_new, Aux(alpha=aux0.alpha, wt=aux0.wt, eps=eps, Xi=Xi, H=H, D=D)
+    """Aux from the INPUT (p, phi), then the power law. Returns (p_new, aux)."""
+    aux = aux_vars(ch, p, phi)
+    return power_update(ch, aux, p), aux
 
 
 # ---------------------------------------------------------------- phase sub-problem
