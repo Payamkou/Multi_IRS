@@ -26,7 +26,8 @@ exp_01 npz it was built from (rebuilt whenever that file changes).
 Curves
 ------
 * Fig. 1: mean WSR ± 1.96·std/sqrt(B) per step 0..L; AO = teacher trajectory columns 0..10,
-  dashed lines at the AO-100 mean ("FP-AO (converged)") and AO-1000 mean ("FP-AO (1000 it.)").
+  dashed lines at the AO-100 mean ("FP-AO (converged)") and AO-1000 mean ("FP-AO (1000 it.)"); a single
+  line "FP-AO (converged, 1000 it.)" when ao_baseline_max_iter = 1000 or the two means coincide.
 * Fig. 2: mean WSR (all B) vs mean cumulative time (subset S). AO WSR per step = teacher
   trajectory column t (explicit and efficient iterates are identical); AO time = mean over the
   subset of the cumulative time, a converged sample holding its final time. Each AO curve runs to
@@ -51,6 +52,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import math
 import os
 from pathlib import Path
 
@@ -337,10 +339,14 @@ def plot_fig1(npz):
         st = _style(label)
         ax.plot(x, m, color=st["color"], marker=st["marker"], label=label)
         ax.fill_between(x, m - c, m + c, color=st["color"], alpha=0.2, linewidth=0)
-    ax.axhline(float(z["ao100_mean"]), color="black", linestyle=(0, (5, 2)), linewidth=0.9,
-               label="FP-AO (converged)")
-    ax.axhline(float(z["ao1000_mean"]), color="grey", linestyle=(0, (2, 1.5)), linewidth=0.9,
-               label="FP-AO (1000 it.)")
+    a100, a1000 = float(z["ao100_mean"]), float(z["ao1000_mean"])
+    cap = int(z["ao_baseline_max_iter"]) if "ao_baseline_max_iter" in z else None
+    if cap == 1000 or math.isclose(a100, a1000, rel_tol=1e-12, abs_tol=1e-12):
+        # the baseline IS the 1000-iteration AO (or the two means coincide): one line, combined label
+        ax.axhline(a100, color="black", linestyle=(0, (5, 2)), linewidth=0.9, label="FP-AO (converged, 1000 it.)")
+    else:
+        ax.axhline(a100, color="black", linestyle=(0, (5, 2)), linewidth=0.9, label="FP-AO (converged)")
+        ax.axhline(a1000, color="grey", linestyle=(0, (2, 1.5)), linewidth=0.9, label="FP-AO (1000 it.)")
     ax.set_xticks(np.arange(L + 1))
     ax.set_xlabel("AO iteration / unfolded layer index")
     ax.set_ylabel("WSR (bits/s/Hz)")

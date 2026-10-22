@@ -476,3 +476,22 @@ def test_gpu_timing_per_point_and_magma(sweep_env, monkeypatch):
     sweeps.run_gpu_timing(sweep_env)
     assert [x for x, _ in seen] == [sweep_env.sweep_K[-1]]
     assert all(os.path.getmtime(q[lab]) == before[lab] for lab in labels if lab != lost)
+
+
+def test_fig1_single_dashed_line_when_baseline_is_ao1000(env):
+    """Final review M5: no duplicated legend entry when the baseline is the 1000-iteration AO."""
+    import matplotlib.pyplot as plt
+    from experiments.convergence import plot_fig1, run_convergence
+    z = dict(np.load(run_convergence(env)))
+
+    def dashed_labels(zz):
+        fig = plot_fig1(zz)
+        labs = [l.get_label() for l in fig.axes[0].get_lines() if l.get_label().startswith("FP-AO (")]
+        plt.close(fig)
+        return labs
+    z["ao1000_mean"] = z["ao100_mean"] + 0.5
+    assert dashed_labels(z) == ["FP-AO (converged)", "FP-AO (1000 it.)"]
+    z1 = dict(z, ao_baseline_max_iter=np.int64(1000), ao1000_mean=z["ao100_mean"])
+    assert dashed_labels(z1) == ["FP-AO (converged, 1000 it.)"]
+    z2 = dict(z, ao1000_mean=z["ao100_mean"])          # coinciding means, cap 20
+    assert dashed_labels(z2) == ["FP-AO (converged, 1000 it.)"]
