@@ -7,7 +7,7 @@ Per layer l and IRS n (after the deterministic block):
     z_n  = [phi_n, ghat_n] padded with zeros / truncated to M_train each -> C^{2 M_train}
     lam  = c * Softplus(Re Psi_{l,n}(z_n))[:M]   (zeros for elements >= M_train)
            c = non-trainable buffer `step_scale`; build_model sets c = 2 mu0 / ln 2 with
-           mu0 = fonr_mu_init(cfg), so the untrained step c*Softplus(0) = 2 mu0 = 1/median(lambda_max)
+           mu0 = fonr_mu_median(cfg), so the untrained step c*Softplus(0) = 2 mu0 = 1/median(lambda_max)
            matches the MM/FONR step scale
     phi_n <- (phi_n + lam r_n) / |phi_n + lam r_n|
 Elements beyond M_train are copied unchanged (exact), i.e. lambda = 0 there.

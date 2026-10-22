@@ -134,25 +134,88 @@ def test_theta_step_formula():
     assert torch.allclose(out, expect)
 
 
-def test_fonr_mu_init_cached(tmp_path, monkeypatch):
-    cfg = dataclasses.replace(Config(), M=16, n_train=12, n_val=2, n_test=2, root=str(tmp_path))
-    mu = fonr_mu_init(cfg)
-    # reference computation
+def _mu_cfg(tmp_path, **kw):
+    base = dict(M=16, n_train=12, n_val=2, n_test=2, root=str(tmp_path), train_device="cpu")
+    base.update(kw)
+    return dataclasses.replace(Config(), **base)
+
+
+def _ref_lams(cfg):
     from data import build_or_load
     d = build_or_load(cfg, "train")
     ch = d["ch"].to("cpu", C128)
     p0, phi0 = ao.init_state(ch, d["theta0"])
     p_new, aux = fp.deterministic_block(ch, p0, phi0)
     lam = ao.lambda_max(ch, p_new, aux, "efficient")
-    med = torch.quantile(lam[lam > 0], 0.5)  # true median (mean of middle pair)
-    assert mu == pytest.approx(1.0 / (2.0 * float(med)), rel=1e-12)
+    return lam[lam > 0]
+
+
+def test_fonr_mu_init_cached(tmp_path, monkeypatch):
+    from models.fonr import fonr_mu_median
+    cfg = _mu_cfg(tmp_path)
+    mu = fonr_mu_init(cfg)
+    pos = _ref_lams(cfg)
+    med = torch.quantile(pos, 0.5)  # true median (mean of middle pair)
+    assert fonr_mu_median(cfg) == pytest.approx(1.0 / (2.0 * float(med)), rel=1e-12)
     path = os.path.join(str(tmp_path), "logs", "fonr_mu_init.json")
-    assert os.path.exists(path)
     with open(path, encoding="utf-8") as f:
-        assert len(json.load(f)) == 1
+        cache = json.load(f)
+    assert len(cache) == 1
+    e = next(iter(cache.values()))
+    for k in ("median_mu", "chosen_q", "mu_init", "per_q", "config_hash"):
+        assert k in e, k
+    q = e["chosen_q"]
+    lam_q = torch.quantile(pos, q) if q < 1 else pos.max()
+    assert mu == pytest.approx(1.0 / (2.0 * float(lam_q)), rel=1e-12)
+    assert e["per_q"][str(q)]["finite"] is True
+    for k in ("mu", "finite", "max_grad_abs"):
+        assert k in e["per_q"][str(q)]
     import models.fonr as mf
     monkeypatch.setattr(mf, "build_or_load", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no cache")))
     assert fonr_mu_init(cfg) == mu
+    assert fonr_mu_median(cfg) == pytest.approx(1.0 / (2.0 * float(med)), rel=1e-12)
+
+
+def test_fonr_mu_init_first_finite_q(tmp_path, monkeypatch):
+    import models.fonr as mf
+    calls = []
+
+    def fake(cfg, mu0, batches):
+        calls.append(mu0)
+        return (len(calls) >= 2, 1.0)  # q=0.5 "non-finite", q=0.9 finite
+
+    monkeypatch.setattr(mf, "_probe_q", fake)
+    cfg = _mu_cfg(tmp_path)
+    mu = fonr_mu_init(cfg)
+    pos = _ref_lams(cfg)
+    assert mu == pytest.approx(1.0 / (2.0 * float(torch.quantile(pos, 0.9))), rel=1e-12)
+    assert len(calls) == 2
+    with open(os.path.join(str(tmp_path), "logs", "fonr_mu_init.json"), encoding="utf-8") as f:
+        e = next(iter(json.load(f).values()))
+    assert e["chosen_q"] == 0.9 and e["probe_failed"] is False
+    assert e["per_q"]["0.5"]["finite"] is False and e["per_q"]["0.9"]["finite"] is True
+
+
+def test_fonr_mu_init_none_finite_falls_back(tmp_path, monkeypatch):
+    import models.fonr as mf
+    monkeypatch.setattr(mf, "_probe_q", lambda cfg, mu0, b: (False, float("inf")))
+    cfg = _mu_cfg(tmp_path)
+    mu = fonr_mu_init(cfg)
+    pos = _ref_lams(cfg)
+    assert mu == pytest.approx(1.0 / (2.0 * float(pos.max())), rel=1e-12)
+    with open(os.path.join(str(tmp_path), "logs", "fonr_mu_init.json"), encoding="utf-8") as f:
+        e = next(iter(json.load(f).values()))
+    assert e["chosen_q"] == 1.0 and e["probe_failed"] is True and len(e["per_q"]) == 4
+
+
+def test_maso_step_scale_uses_median_mu(tmp_path, monkeypatch):
+    import models.fonr as mf
+    from models.fonr import fonr_mu_median
+    monkeypatch.setattr(mf, "_probe_q", lambda cfg, mu0, b: (False, float("inf")))  # mu_init != median
+    cfg = _mu_cfg(tmp_path)
+    assert fonr_mu_init(cfg) != pytest.approx(fonr_mu_median(cfg))
+    net = build_model("maso", cfg)
+    assert float(net.step_scale) == pytest.approx(2 * fonr_mu_median(cfg) / math.log(2), rel=1e-6)
 
 
 def test_build_model_fonr():
@@ -297,7 +360,7 @@ def test_maso_step_scale_buffer_and_scaling():
 
 def test_build_model_maso_step_scale_from_fonr_mu(monkeypatch):
     import models.fonr as mf
-    monkeypatch.setattr(mf, "fonr_mu_init", lambda cfg: 0.25)
+    monkeypatch.setattr(mf, "fonr_mu_median", lambda cfg: 0.25)
     net = build_model("maso", Config())
     assert float(net.step_scale) == pytest.approx(2 * 0.25 / math.log(2))
     assert float(build_model("maso", Config(), step_scale=7.0).step_scale) == 7.0

@@ -17,8 +17,8 @@ def build_model(name: str, cfg, **kw) -> UnfoldedNet:
         from . import fonr as _fonr
         from .maso import MASO
         step_scale = kw.pop("step_scale", None)
-        if step_scale is None:  # c = 2 mu0 / ln 2 -> untrained step c*Softplus(0) = 2 mu0
-            step_scale = 2.0 * _fonr.fonr_mu_init(cfg) / math.log(2.0)
+        if step_scale is None:  # c = 2 mu_med / ln 2 -> untrained step c*Softplus(0) = 2 mu_med
+            step_scale = 2.0 * _fonr.fonr_mu_median(cfg) / math.log(2.0)
         return MASO(L=kw.pop("L", cfg.L), N=kw.pop("N", cfg.N),
                     M_train=kw.pop("M_train", cfg.maso_M_train), step_scale=step_scale)
     if name == "tias":
