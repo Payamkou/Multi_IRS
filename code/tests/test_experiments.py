@@ -163,3 +163,66 @@ def test_plots_written_fig1_fig2_fig3(env):
             assert os.path.exists(f) and os.path.getsize(f) > 0
         assert name in out
     assert os.path.normpath(env.paper_dir) != os.path.normpath("E:/payam/Paper")
+
+
+def _copy_env(env, tmp_path, tag):
+    import shutil
+    root = tmp_path / tag
+    shutil.copytree(env.root, root, ignore=shutil.ignore_patterns("results"))
+    return dataclasses.replace(env, root=str(root))
+
+
+def test_cache_fingerprint_helper(env, tmp_path):
+    from experiments.cache import artifact_fingerprint
+    cfg = _copy_env(env, tmp_path, "fp")
+    f1 = artifact_fingerprint(cfg)
+    assert set(f1) == {"checkpoints/fonr_best.pt", "checkpoints/maso_best.pt",
+                       "checkpoints/tias_best.pt", "datasets/teacher_labels.pt"}
+    assert artifact_fingerprint(cfg) == f1
+    p = os.path.join(cfg.root, "checkpoints", "tias_best.pt")
+    ck = torch.load(p, weights_only=False)
+    ck["model_state"] = {k: v + 0.5 if v.is_floating_point() else v for k, v in ck["model_state"].items()}
+    torch.save(ck, p)
+    assert artifact_fingerprint(cfg)["checkpoints/tias_best.pt"] != f1["checkpoints/tias_best.pt"]
+
+
+def test_cache_recompute_on_checkpoint_change(env, tmp_path, capsys):
+    from experiments.convergence import run_cdf, run_convergence
+    cfg = _copy_env(env, tmp_path, "rc")
+    p = run_convergence(cfg)
+    q = run_cdf(cfg)
+    w1 = np.load(p)["wsr_tias"].copy()
+    m1, mq = os.path.getmtime(p), os.path.getmtime(q)
+    time.sleep(0.05)
+    ck_p = os.path.join(cfg.root, "checkpoints", "tias_best.pt")
+    ck = torch.load(ck_p, weights_only=False)
+    torch.manual_seed(12345)
+    ck["model_state"] = build_model("tias", cfg).state_dict()
+    torch.save(ck, ck_p)
+    run_convergence(cfg)
+    assert os.path.getmtime(p) > m1
+    assert "recomput" in capsys.readouterr().out.lower()
+    assert np.abs(np.load(p)["wsr_tias"] - w1).max() > 1e-9  # new weights, new values
+    # the CDF follows the new convergence npz
+    c = np.load(run_cdf(cfg))
+    assert os.path.getmtime(q) > mq
+    assert np.allclose(c["gap_tias"], np.load(p)["wsr_ao100"] - np.load(p)["wsr_tias"][:, -1])
+
+
+def test_cdf_rebuilt_after_convergence_force_rerun(env, tmp_path):
+    from experiments.convergence import run_cdf, run_convergence
+    cfg = _copy_env(env, tmp_path, "fr")
+    run_convergence(cfg)
+    q = run_cdf(cfg)
+    mq = os.path.getmtime(q)
+    time.sleep(0.05)
+    run_convergence(cfg, force_rerun=True)
+    run_cdf(cfg)
+    assert os.path.getmtime(q) > mq
+
+
+def test_summary_ao_baseline_max_iter(env):
+    from experiments.convergence import run_convergence, summarize_convergence
+    p = run_convergence(env)
+    assert int(np.load(p)["ao_baseline_max_iter"]) == env.ao_max_iter
+    assert summarize_convergence(p)["ao_baseline_max_iter"] == float(env.ao_max_iter)

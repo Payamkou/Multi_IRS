@@ -14,11 +14,14 @@ Raw results (``{cfg.root}/results``)
   * ``ao_cumtime_{mode}``  (S, T+1) cumulative seconds (0 at step 0), held after convergence,
                             mode in explicit/efficient (``timing.time_until_converged``).
   * ``ao_wsr_timed_{mode}`` (S, T+1) WSR of the batch-1 timing run (held), ``ao_niter_{mode}`` (S,).
-  * ``timing_idx`` (S,), ``timing_threads``, ``cfg_json``, ``cfg_hash``.
+  * ``timing_idx`` (S,), ``timing_threads``, ``cfg_json``, ``cfg_hash``, ``ao_baseline_max_iter``,
+    ``artifact_fingerprint`` (experiments.cache; checkpoints + teacher labels, size:sha256).
+  Cache: reused only if cfg_hash and artifact_fingerprint match, else recomputed with a notice.
   S = cfg.timing_subset (first S test samples) or all; the same subset for every method.
 
 ``exp_03_cdf.npz`` (+ ``exp_03_cdf.csv``): ``gap_{n}`` = R_AO100 - R_n(L) and
-``gap_vs1000_{n}`` = R_AO1000 - R_n(L) per test sample (bits).
+``gap_vs1000_{n}`` = R_AO1000 - R_n(L) per test sample (bits); ``conv_sha256`` of the
+exp_01 npz it was built from (rebuilt whenever that file changes).
 
 Curves
 ------
@@ -31,6 +34,7 @@ Curves
 
 ``summarize_convergence`` keys (floats; consumed by the report)
 --------------------------------------------------------------
+* ``ao_baseline_max_iter`` (= cfg.ao_max_iter, the "AO-100" iteration cap)
 * ``ao100_mean``, ``ao1000_mean``, ``n_test``, ``n_timing``, ``timing_threads``
 * ``recovery_pct_layer{4,6,8}_{fonr,maso,tias,ao}`` = 100·(R̄_l − R̄_0)/(R̄_AO100 − R̄_0)
   (``ao`` uses AO iteration l of the teacher trajectory)
@@ -63,6 +67,7 @@ import teacher
 import timing
 import train
 from config import Config, config_hash
+from experiments.cache import artifact_fingerprint, check_cache, file_sha256, fingerprint_array
 from models import build_model
 
 NETS = ("fonr", "maso", "tias")
@@ -78,13 +83,6 @@ def _results_dir(cfg: Config) -> str:
     d = os.path.join(cfg.root, "results")
     os.makedirs(d, exist_ok=True)
     return d
-
-
-def _check_cache(path: str, cfg: Config) -> None:
-    with np.load(path) as z:
-        h = str(z["cfg_hash"])
-    if h != config_hash(cfg, EXP_KEYS):
-        raise ValueError(f"{path} was produced with a different config; use force_rerun=True")
 
 
 def _load(npz):
@@ -154,8 +152,8 @@ def _wsr_per_layer(model, ch, theta0, device, chunk: int = 250) -> np.ndarray:
 def run_convergence(cfg: Config, force_rerun: bool = False) -> Path:
     """Per-layer WSR (all test samples) and CPU batch-1 timings; cached as exp_01_convergence.npz."""
     path = os.path.join(_results_dir(cfg), "exp_01_convergence.npz")
-    if os.path.exists(path) and not force_rerun:
-        _check_cache(path, cfg)
+    fpr = artifact_fingerprint(cfg)
+    if not force_rerun and check_cache(path, cfg, EXP_KEYS, fpr):
         return Path(path)
 
     d = data.build_or_load(cfg, "test")
@@ -168,6 +166,7 @@ def run_convergence(cfg: Config, force_rerun: bool = False) -> Path:
         "wsr_ao1000": t["wsr_ref1000"].double().numpy(), "n_iter_ao1000": t["n_iter_ref1000"].numpy(),
     }
     out["ao100_mean"] = np.float64(out["wsr_ao100"].mean())
+    out["ao_baseline_max_iter"] = np.int64(cfg.ao_max_iter)
     out["ao1000_mean"] = np.float64(out["wsr_ao1000"].mean())
     for n, m in models.items():
         out[f"wsr_{n}"] = _wsr_per_layer(m, ch, theta0, cfg.eval_device)
@@ -202,7 +201,8 @@ def run_convergence(cfg: Config, force_rerun: bool = False) -> Path:
         torch.set_num_threads(prev)
 
     out.update(timing_idx=idx, timing_threads=np.int64(threads), nets=np.array(NETS),
-               cfg_json=np.array(json.dumps(cfg.to_dict())), cfg_hash=np.array(config_hash(cfg, EXP_KEYS)))
+               cfg_json=np.array(json.dumps(cfg.to_dict())), cfg_hash=np.array(config_hash(cfg, EXP_KEYS)),
+               artifact_fingerprint=fingerprint_array(fpr))
     _atomic_npz(path, **out)
     _write_convergence_csv(cfg, out)
     with open(os.path.join(_results_dir(cfg), "exp_01_convergence_summary.json"), "w", encoding="utf-8") as f:
@@ -249,7 +249,8 @@ def summarize_convergence(npz) -> dict:
     """Key numbers of experiments 1-3 (key names in the module docstring)."""
     z = _load(npz)
     ao100, ao1000 = float(z["ao100_mean"]), float(z["ao1000_mean"])
-    s = {"ao100_mean": ao100, "ao1000_mean": ao1000, "n_test": float(z["wsr_ao100"].shape[0]),
+    s = {"ao100_mean": ao100, "ao1000_mean": ao1000,
+         "ao_baseline_max_iter": float(z["ao_baseline_max_iter"]), "n_test": float(z["wsr_ao100"].shape[0]),
          "n_timing": float(len(z["timing_idx"])), "timing_threads": float(z["timing_threads"])}
     traj_mean = z["wsr_ao_traj"].mean(0)
     for l in RECOVERY_LAYERS:
@@ -279,12 +280,16 @@ def summarize_convergence(npz) -> dict:
 def run_cdf(cfg: Config, force_rerun: bool = False) -> Path:
     """ΔR = R_AO(converged) − R_method(L) per test sample; cached as exp_03_cdf.npz."""
     path = os.path.join(_results_dir(cfg), "exp_03_cdf.npz")
-    if os.path.exists(path) and not force_rerun:
-        _check_cache(path, cfg)
+    conv = run_convergence(cfg)
+    conv_sha = file_sha256(conv)
+    fpr = artifact_fingerprint(cfg)
+    if not force_rerun and check_cache(path, cfg, EXP_KEYS, fpr, {"conv_sha256": conv_sha}):
         return Path(path)
-    z = _load(run_convergence(cfg))
+    z = _load(conv)
     out = {"wsr_ao100": z["wsr_ao100"], "wsr_ao1000": z["wsr_ao1000"], "nets": np.array(NETS),
-           "cfg_json": z["cfg_json"], "cfg_hash": z["cfg_hash"]}
+           "cfg_json": z["cfg_json"], "cfg_hash": z["cfg_hash"], "conv_sha256": np.array(conv_sha),
+           "artifact_fingerprint": fingerprint_array(fpr),
+           "ao_baseline_max_iter": z["ao_baseline_max_iter"]}
     rows = [{"sample": i} for i in range(len(z["wsr_ao100"]))]
     for n in NETS:
         wl = z[f"wsr_{n}"][:, -1]
