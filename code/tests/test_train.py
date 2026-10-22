@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import ao
+import data
 import fp_core as fp
 from channels import generate_channels
 from config import Config
@@ -98,3 +99,177 @@ def test_deep_supervision_grads_finite_complex64_zero_power_user():
     assert torch.isfinite(loss)
     loss.backward()
     assert torch.isfinite(net.mu.grad).all() and net.mu.grad.abs().sum() > 0
+
+
+# ================================================================ training loop (Task 10)
+import csv
+import json
+import math
+import os
+import shutil
+import time
+
+import teacher
+import train
+
+HIST_COLS = ["epoch", "stage", "lr", "train_loss", "val_loss", "train_wsr_mean", "train_wsr_std",
+             "val_wsr_mean", "val_wsr_std", "val_phase_cosine_sim", "is_best", "epoch_time_sec"]
+
+
+def _tiny_cfg(root, **kw):
+    base = dict(n_train=64, n_val=16, n_test=16, M=16, n_sup_epochs=2, n_unsup_epochs=2,
+                batch_size=32, train_device="cpu", eval_device="cpu", lr_grid=(0.01,),
+                pilot_sup_epochs=1, pilot_unsup_epochs=1, ao_max_iter=20, root=str(root))
+    base.update(kw)
+    return dataclasses.replace(Config(), **base)
+
+
+@pytest.fixture(scope="module")
+def base_root(tmp_path_factory):
+    root = tmp_path_factory.mktemp("train_base")
+    teacher.build_teacher_labels(_tiny_cfg(root), chunk=64)
+    return root
+
+
+@pytest.fixture
+def fresh_root(base_root, tmp_path):
+    """A new artifacts root that shares the (copied) tiny datasets and teacher labels."""
+    def make(tag):
+        r = tmp_path / tag
+        shutil.copytree(base_root / "datasets", r / "datasets")
+        if (base_root / "logs").exists():
+            shutil.copytree(base_root / "logs", r / "logs")
+        return r
+    return make
+
+
+def _read_csv(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+@pytest.mark.parametrize("name", ["fonr", "tias"])
+def test_resume_is_exact(name, fresh_root):
+    cfg_a = _tiny_cfg(fresh_root("a"))
+    cfg_b = _tiny_cfg(fresh_root("b"))
+    pa = train.train_model(name, cfg_a)
+    train.train_model(name, cfg_b, stop_after_epoch=2)
+    ck_mid = torch.load(os.path.join(cfg_b.root, "checkpoints", f"{name}_last.pt"), weights_only=False)
+    assert ck_mid["epoch"] == 2
+    pb = train.train_model(name, cfg_b)
+    la = torch.load(os.path.join(cfg_a.root, "checkpoints", f"{name}_last.pt"), weights_only=False)
+    lb = torch.load(os.path.join(cfg_b.root, "checkpoints", f"{name}_last.pt"), weights_only=False)
+    assert la["epoch"] == lb["epoch"] == 4
+    for k, v in la["model_state"].items():  # bit-exact (NaN == NaN so a diverged run still compares)
+        torch.testing.assert_close(v, lb["model_state"][k], rtol=0, atol=0, equal_nan=True)
+    for k, v in la["optimizer_state"]["state"].items():
+        for kk, vv in v.items():
+            torch.testing.assert_close(vv, lb["optimizer_state"]["state"][k][kk], rtol=0, atol=0, equal_nan=True)
+    assert os.path.exists(pa) == os.path.exists(pb)
+    if os.path.exists(pa):
+        ba = torch.load(pa, weights_only=False)["model_state"]
+        bb = torch.load(pb, weights_only=False)["model_state"]
+        for k, v in ba.items():
+            torch.testing.assert_close(v, bb[k], rtol=0, atol=0, equal_nan=True)
+    ha = _read_csv(os.path.join(cfg_a.root, "logs", f"{name}_training_history.csv"))
+    hb = _read_csv(os.path.join(cfg_b.root, "logs", f"{name}_training_history.csv"))
+    assert len(ha) == len(hb) == 4
+    for ra, rb in zip(ha, hb):
+        ra.pop("epoch_time_sec"), rb.pop("epoch_time_sec")
+        assert ra == rb
+
+
+def test_completed_training_not_rerun(fresh_root):
+    cfg = _tiny_cfg(fresh_root("c"))
+    best = train.train_model("fonr", cfg)
+    last = os.path.join(cfg.root, "checkpoints", "fonr_last.pt")
+    m1 = os.path.getmtime(last)
+    time.sleep(0.05)
+    assert train.train_model("fonr", cfg) == best
+    assert os.path.getmtime(last) == m1
+
+
+def test_resume_refuses_mismatched_config(fresh_root):
+    cfg = _tiny_cfg(fresh_root("d"))
+    train.train_model("fonr", cfg, stop_after_epoch=1)
+    with pytest.raises(ValueError, match="config mismatch"):
+        train.train_model("fonr", dataclasses.replace(cfg, batch_size=16))
+
+
+def test_history_columns_and_checkpoint_keys(fresh_root):
+    cfg = _tiny_cfg(fresh_root("e"))
+    best = train.train_model("tias", cfg)
+    with open(os.path.join(cfg.root, "logs", "tias_training_history.csv"), newline="") as f:
+        header = next(csv.reader(f))
+    assert header == HIST_COLS
+    rows = _read_csv(os.path.join(cfg.root, "logs", "tias_training_history.csv"))
+    assert [r["stage"] for r in rows] == ["supervised", "supervised", "unsupervised", "unsupervised"]
+    ck = torch.load(best, weights_only=False)
+    for k in ("model_name", "epoch", "stage", "model_state", "optimizer_state", "selected_lr",
+              "best_val_wsr", "best_epoch", "rng_cpu", "rng_cuda", "metrics_history", "config", "cfg_hash"):
+        assert k in ck, k
+    assert ck["cfg_hash"] == train.config_hash(cfg, train.TRAIN_KEYS)
+    assert ck["selected_lr"] == 0.01
+
+
+def test_no_test_metrics_in_history(fresh_root):
+    cfg = _tiny_cfg(fresh_root("f"))
+    best = train.train_model("tias", cfg)
+    last = os.path.join(cfg.root, "checkpoints", "tias_last.pt")
+    for path in (best, last):
+        mh = torch.load(path, weights_only=False)["metrics_history"]
+        assert mh and not any(k.startswith("test") for k in mh)
+        assert any(k.startswith("train") for k in mh) and any(k.startswith("val") for k in mh)
+
+
+def test_lr_pilot_csv_and_reuse(fresh_root):
+    cfg = _tiny_cfg(fresh_root("g"), lr_grid=(0.01, 0.001))
+    lr = train.run_lr_pilot("tias", cfg)
+    path = os.path.join(cfg.root, "logs", "tias_lr_pilot.csv")
+    rows = _read_csv(path)
+    assert list(rows[0].keys()) == ["lr", "epoch", "stage", "val_wsr_mean"]
+    assert len(rows) == 2 * (cfg.pilot_sup_epochs + cfg.pilot_unsup_epochs)
+    final = {float(r["lr"]): float(r["val_wsr_mean"]) for r in rows if int(r["epoch"]) == 2}
+    assert lr == max(final, key=final.get)
+    m1 = os.path.getmtime(path)
+    time.sleep(0.05)
+    assert train.run_lr_pilot("tias", cfg) == lr
+    with pytest.raises(ValueError, match="config mismatch"):
+        train.run_lr_pilot("tias", dataclasses.replace(cfg, pilot_unsup_epochs=2))
+    assert os.path.getmtime(path) == m1
+
+
+def test_evaluate_complex128_default(fresh_root):
+    cfg = _tiny_cfg(fresh_root("h"))
+    d = data.build_or_load(cfg, "val")
+    t = teacher.load_teacher(cfg, "val")
+    from models import build_model
+    net = build_model("tias", cfg)
+    r = train.evaluate(net, d["ch"], d["theta0"], phi_star=t["phi_star"], a=0.5)
+    assert r["wsr_per_sample"].dtype == torch.float64 and r["wsr_per_sample"].shape == (16,)
+    assert next(net.parameters()).dtype == torch.float32  # caller's model untouched
+    assert math.isfinite(r["loss"]) and -1.0 <= r["phase_cos"] <= 1.0
+    r32 = train.evaluate(net, d["ch"], d["theta0"], phi_star=t["phi_star"], cdtype=torch.complex64)
+    assert r32["wsr_per_sample"].dtype == torch.float32
+    assert r32["wsr_mean"] == pytest.approx(r["wsr_mean"], rel=1e-3)
+
+
+def test_final_metrics_row(fresh_root):
+    cfg = _tiny_cfg(fresh_root("i"))
+    train.train_model("tias", cfg)
+    out = train.final_metrics("tias", cfg)
+    rows = _read_csv(os.path.join(cfg.root, "logs", "all_models_final_metrics.csv"))
+    assert len(rows) == 1
+    assert list(rows[0].keys()) == train.FINAL_COLS
+    cols = ["model_name", "selected_lr", "best_epoch"]
+    for s in ("train", "val", "test"):
+        cols += [f"{s}_{c}" for c in ("loss", "wsr_mean", "wsr_std", "ao_wsr_mean", "efficiency_pct")]
+    cols += ["test_gap_median", "test_gap_95th_pctl", "test_gap_min_left_tail"]
+    assert set(cols) <= set(rows[0].keys())
+    assert math.isfinite(float(rows[0]["test_gap_95th_pctl"]))
+    assert out["test_efficiency_pct"] == pytest.approx(100 * out["test_wsr_mean"] / out["test_ao_wsr_mean"])
+    with open(os.path.join(cfg.root, "logs", "tias_final_metrics.json")) as f:
+        assert json.load(f)["model_name"] == "tias"
+    assert all(math.isfinite(float(rows[0][c])) for c in train.FINAL_COLS[1:])
+    train.final_metrics("tias", cfg)  # upsert, not append
+    assert len(_read_csv(os.path.join(cfg.root, "logs", "all_models_final_metrics.csv"))) == 1
