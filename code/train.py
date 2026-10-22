@@ -70,7 +70,7 @@ def loss_deep_supervision(ch: ChannelBatch, traj: Trajectory, a: float = 0.5) ->
 
 
 # ================================================================ training loop (spec §8)
-TRAIN_KEYS = ("N", "M", "K", "L", "T", "n_train", "n_sup_epochs", "n_unsup_epochs", "batch_size",
+TRAIN_KEYS = data.CHANNEL_KEYS + ("N", "M", "K", "L", "T", "n_train", "n_sup_epochs", "n_unsup_epochs", "batch_size",
               "lr_grid", "loss_a", "maso_M_train", "tias_hidden", "grad_clip_norm")
 PILOT_KEYS = TRAIN_KEYS + ("pilot_sup_epochs", "pilot_unsup_epochs")
 
