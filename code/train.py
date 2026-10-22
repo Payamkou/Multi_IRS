@@ -71,11 +71,12 @@ def loss_deep_supervision(ch: ChannelBatch, traj: Trajectory, a: float = 0.5) ->
 
 # ================================================================ training loop (spec §8)
 TRAIN_KEYS = ("N", "M", "K", "L", "T", "n_train", "n_sup_epochs", "n_unsup_epochs", "batch_size",
-              "lr_grid", "loss_a", "maso_M_train", "tias_hidden")
+              "lr_grid", "loss_a", "maso_M_train", "tias_hidden", "grad_clip_norm")
 PILOT_KEYS = TRAIN_KEYS + ("pilot_sup_epochs", "pilot_unsup_epochs")
 
 HISTORY_COLS = ["epoch", "stage", "lr", "train_loss", "val_loss", "train_wsr_mean", "train_wsr_std",
-                "val_wsr_mean", "val_wsr_std", "val_phase_cosine_sim", "is_best", "epoch_time_sec"]
+                "val_wsr_mean", "val_wsr_std", "val_phase_cosine_sim", "is_best", "epoch_time_sec",
+                "n_skipped_batches"]  # spec §8 columns + one trailing column (controller ruling)
 PILOT_COLS = ["lr", "epoch", "stage", "val_wsr_mean"]
 FINAL_COLS = (["model_name", "selected_lr", "best_epoch"]
               + [f"{s}_{c}" for s in ("train", "val", "test")
@@ -185,13 +186,31 @@ def _fresh_model(name: str, cfg: Config, device):
     return build_model(name, cfg).to(device)
 
 
+def _optimizer_step(model, opt, loss: torch.Tensor, max_norm: float) -> bool:
+    """Backward + guarded step, identical for every model. Returns True if the batch was skipped.
+
+    Non-finite loss or any non-finite parameter gradient -> grads cleared, no optimizer step
+    (Adam state untouched). Otherwise clip the global grad norm to ``max_norm`` and step."""
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    params = [p for p in model.parameters() if p.grad is not None]
+    ok = bool(torch.isfinite(loss.detach())) and all(bool(torch.isfinite(p.grad).all()) for p in params)
+    if not ok:
+        opt.zero_grad(set_to_none=True)
+        return True
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+    opt.step()
+    return False
+
+
 def _train_epoch(model, opt, D: _Data, cfg: Config, epoch: int, n_sup: int) -> dict:
     """One epoch; epochs 1..n_sup supervised, later deep-supervised Stage II.
-    train_* are means over the epoch's batches (train_wsr_std = mean of per-batch stds)."""
+    train_* are means over the epoch's batches (train_wsr_std = mean of per-batch stds);
+    n_skipped_batches counts batches whose step was skipped for non-finite loss/gradients."""
     model.train()
     gen = torch.Generator().manual_seed(seed_for("train") + epoch)
     perm = torch.randperm(D.B, generator=gen)
-    losses, means, stds = [], [], []
+    losses, means, stds, n_skip = [], [], [], 0
     for lo in range(0, D.B, cfg.batch_size):
         idx = perm[lo:lo + cfg.batch_size].to(D.device)
         c = D.ch.slice(idx)
@@ -200,9 +219,7 @@ def _train_epoch(model, opt, D: _Data, cfg: Config, epoch: int, n_sup: int) -> d
             loss = loss_supervised(tr.phi[-1], D.phi_star[idx])
         else:
             loss = loss_deep_supervision(c, tr, cfg.loss_a)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+        n_skip += _optimizer_step(model, opt, loss, cfg.grad_clip_norm)
         with torch.no_grad():
             w = fp.wsr(c, tr.p[-1].detach(), tr.phi[-1].detach())
         losses.append(loss.item())
@@ -210,7 +227,7 @@ def _train_epoch(model, opt, D: _Data, cfg: Config, epoch: int, n_sup: int) -> d
         stds.append(float(w.std()) if w.numel() > 1 else 0.0)
     nb = len(losses)
     return {"train_loss": sum(losses) / nb, "train_wsr_mean": sum(means) / nb,
-            "train_wsr_std": sum(stds) / nb}
+            "train_wsr_std": sum(stds) / nb, "n_skipped_batches": int(n_skip)}
 
 
 def _val(model, D: _Data, cfg: Config) -> dict:
@@ -261,7 +278,8 @@ def run_lr_pilot(name: str, cfg: Config) -> float:
             st = _stage(ep, n_sup)
             rows.append({"lr": lr, "epoch": ep, "stage": st, "val_wsr_mean": v["wsr_mean"]})
             print(f"[pilot {name} lr={lr:g}] epoch {ep}/{n_tot} {st} train_loss={m['train_loss']:.5g} "
-                  f"val_wsr={v['wsr_mean']:.4f} t={time.time() - t0:.1f}s", flush=True)
+                  f"val_wsr={v['wsr_mean']:.4f} skipped={m['n_skipped_batches']} "
+                  f"t={time.time() - t0:.1f}s", flush=True)
     choice = _pilot_choice(rows)
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump({"cfg_hash": h, "selected_lr": choice, "lr_grid": list(cfg.lr_grid)}, f, indent=2)
@@ -341,7 +359,8 @@ def train_model(name: str, cfg: Config, resume: bool = True, force_retrain: bool
         _write_csv(hist_p, HISTORY_COLS, _history_rows(mh))
         mark = " *" if is_best else ""
         print(f"[{name}] epoch {ep}/{n_tot} {st} train_loss={m['train_loss']:.5g} "
-              f"val_wsr={v['wsr_mean']:.4f}{mark} t={row['epoch_time_sec']:.1f}s", flush=True)
+              f"val_wsr={v['wsr_mean']:.4f}{mark} skipped={m['n_skipped_batches']} "
+              f"t={row['epoch_time_sec']:.1f}s", flush=True)
         if stop_after_epoch is not None and ep >= stop_after_epoch:
             break
     if not os.path.exists(best_p):

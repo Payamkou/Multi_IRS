@@ -38,6 +38,7 @@ class Config:
     pilot_sup_epochs: int = 5
     pilot_unsup_epochs: int = 15
     loss_a: float = 0.5
+    grad_clip_norm: float = 1.0
     maso_M_train: int = 80
     tias_hidden: int = 32
     sweep_M: tuple = (20, 40, 60, 80, 100, 120, 140, 160, 180)

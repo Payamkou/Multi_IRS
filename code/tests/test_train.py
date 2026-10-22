@@ -113,7 +113,8 @@ import teacher
 import train
 
 HIST_COLS = ["epoch", "stage", "lr", "train_loss", "val_loss", "train_wsr_mean", "train_wsr_std",
-             "val_wsr_mean", "val_wsr_std", "val_phase_cosine_sim", "is_best", "epoch_time_sec"]
+             "val_wsr_mean", "val_wsr_std", "val_phase_cosine_sim", "is_best", "epoch_time_sec",
+             "n_skipped_batches"]
 
 
 def _tiny_cfg(root, **kw):
@@ -160,17 +161,16 @@ def test_resume_is_exact(name, fresh_root):
     la = torch.load(os.path.join(cfg_a.root, "checkpoints", f"{name}_last.pt"), weights_only=False)
     lb = torch.load(os.path.join(cfg_b.root, "checkpoints", f"{name}_last.pt"), weights_only=False)
     assert la["epoch"] == lb["epoch"] == 4
-    for k, v in la["model_state"].items():  # bit-exact (NaN == NaN so a diverged run still compares)
-        torch.testing.assert_close(v, lb["model_state"][k], rtol=0, atol=0, equal_nan=True)
+    for k, v in la["model_state"].items():  # bit-exact and finite
+        assert torch.isfinite(v).all(), k
+        assert torch.equal(v, lb["model_state"][k]), k
     for k, v in la["optimizer_state"]["state"].items():
         for kk, vv in v.items():
-            torch.testing.assert_close(vv, lb["optimizer_state"]["state"][k][kk], rtol=0, atol=0, equal_nan=True)
-    assert os.path.exists(pa) == os.path.exists(pb)
-    if os.path.exists(pa):
-        ba = torch.load(pa, weights_only=False)["model_state"]
-        bb = torch.load(pb, weights_only=False)["model_state"]
-        for k, v in ba.items():
-            torch.testing.assert_close(v, bb[k], rtol=0, atol=0, equal_nan=True)
+            assert torch.equal(vv, lb["optimizer_state"]["state"][k][kk]), (k, kk)
+    ba = torch.load(pa, weights_only=False)["model_state"]
+    bb = torch.load(pb, weights_only=False)["model_state"]
+    for k, v in ba.items():
+        assert torch.equal(v, bb[k]), k
     ha = _read_csv(os.path.join(cfg_a.root, "logs", f"{name}_training_history.csv"))
     hb = _read_csv(os.path.join(cfg_b.root, "logs", f"{name}_training_history.csv"))
     assert len(ha) == len(hb) == 4
@@ -273,3 +273,66 @@ def test_final_metrics_row(fresh_root):
     assert all(math.isfinite(float(rows[0][c])) for c in train.FINAL_COLS[1:])
     train.final_metrics("tias", cfg)  # upsert, not append
     assert len(_read_csv(os.path.join(cfg.root, "logs", "all_models_final_metrics.csv"))) == 1
+
+
+def test_grad_clip_norm_in_train_keys():
+    assert Config().grad_clip_norm == 1.0
+    assert "grad_clip_norm" in train.TRAIN_KEYS
+
+
+def test_nonfinite_gradient_step_is_skipped():
+    torch.manual_seed(0)
+    net = torch.nn.Linear(3, 1)
+    opt = torch.optim.Adam(net.parameters(), lr=0.1)
+    x = torch.randn(4, 3)
+    assert train._optimizer_step(net, opt, net(x).pow(2).mean(), 1.0) is False  # normal step
+    before = {k: v.clone() for k, v in net.state_dict().items()}
+    st_before = {k: {kk: vv.clone() for kk, vv in v.items()} for k, v in opt.state_dict()["state"].items()}
+    bad = net(x).sum() * torch.tensor(float("nan"))
+    assert train._optimizer_step(net, opt, bad, 1.0) is True
+    for k, v in net.state_dict().items():
+        assert torch.equal(v, before[k])
+    for k, v in opt.state_dict()["state"].items():
+        for kk, vv in v.items():
+            assert torch.equal(vv, st_before[k][kk])
+    assert all(p.grad is None for p in net.parameters())
+    inf_grad = net(x * float("inf")).sum()  # finite-or-not loss with inf grads
+    assert train._optimizer_step(net, opt, inf_grad, 1.0) is True
+
+
+def test_grad_clipped_to_max_norm():
+    net = torch.nn.Linear(3, 1)
+    opt = torch.optim.SGD(net.parameters(), lr=1.0)
+    w0 = [p.detach().clone() for p in net.parameters()]
+    loss = 1e6 * net(torch.ones(1, 3)).sum()
+    train._optimizer_step(net, opt, loss, 1.0)
+    step = torch.cat([(p.detach() - w).flatten() for p, w in zip(net.parameters(), w0)])
+    assert float(step.norm()) == pytest.approx(1.0, rel=1e-5)
+
+
+def test_epoch_counts_skipped_batches(fresh_root, monkeypatch):
+    cfg = _tiny_cfg(fresh_root("j"))
+    D = train._Data(cfg, "cpu")
+    net = train._fresh_model("tias", cfg, "cpu")
+    opt = torch.optim.Adam(net.parameters(), lr=0.01)
+    w0 = {k: v.clone() for k, v in net.state_dict().items()}
+    monkeypatch.setattr(train, "loss_supervised", lambda a, b: (a * b.conj()).real.mean() * float("nan"))
+    m = train._train_epoch(net, opt, D, cfg, 1, cfg.n_sup_epochs)
+    assert m["n_skipped_batches"] == 2
+    for k, v in net.state_dict().items():
+        assert torch.equal(v, w0[k])
+    assert opt.state_dict()["state"] == {}
+
+
+def test_fonr_tiny_training_finite_with_best(fresh_root):
+    cfg = _tiny_cfg(fresh_root("k"))
+    best = train.train_model("fonr", cfg)
+    assert os.path.exists(best)
+    ck = torch.load(best, weights_only=False)
+    assert all(torch.isfinite(v).all() for v in ck["model_state"].values())
+    assert math.isfinite(ck["best_val_wsr"])
+    rows = _read_csv(os.path.join(cfg.root, "logs", "fonr_training_history.csv"))
+    assert all(math.isfinite(float(r["val_wsr_mean"])) for r in rows)
+    last = torch.load(os.path.join(cfg.root, "checkpoints", "fonr_last.pt"), weights_only=False)
+    assert all(torch.isfinite(v).all() for v in last["model_state"].values())
+    assert last["metrics_history"]["n_skipped_batches"] == [int(r["n_skipped_batches"]) for r in rows]
