@@ -108,3 +108,20 @@ def test_seed_registry_unique():
     seeds += [seed_for("model_init")]
     allseeds = seeds + [s + 7 for s in seeds[:-1]]
     assert len(set(allseeds)) == len(allseeds)
+
+
+def test_cache_invalidated_on_config_change(tmp_path):
+    cfg = dataclasses.replace(Config(), root=str(tmp_path), n_val=3)
+    d1 = data.build_or_load(cfg, "val")
+    path = os.path.join(str(tmp_path), "datasets", "val.pt")
+    m1 = os.path.getmtime_ns(path) if hasattr(os.path, "getmtime_ns") else os.stat(path).st_mtime_ns
+    cfg2 = dataclasses.replace(cfg, irs_pos=((12., 10.), (12., -10.)))
+    d2 = data.build_or_load(cfg2, "val")
+    assert os.stat(path).st_mtime_ns != m1
+    assert not torch.equal(d1["ch"].b, d2["ch"].b)
+    assert d2["meta"]["config_hash"] != d1["meta"]["config_hash"]
+    assert not os.path.exists(path + ".tmp")
+    # same config again loads from cache
+    m2 = os.stat(path).st_mtime_ns
+    data.build_or_load(cfg2, "val")
+    assert os.stat(path).st_mtime_ns == m2

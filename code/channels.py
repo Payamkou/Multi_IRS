@@ -77,6 +77,7 @@ def generate_channels(cfg: Config, B: int, seed: int, M=None, K=None, crn_dbm=No
     K = cfg.K if K is None else int(K)
     crn_dbm = cfg.crn_dbm if crn_dbm is None else float(crn_dbm)
     N = len(cfg.irs_pos)
+    assert cfg.N == N, "cfg.N must equal len(cfg.irs_pos)"
     gen = torch.Generator().manual_seed(int(seed))
     gph = torch.Generator().manual_seed(int(seed) + 7)
     inv_sigma = 1.0 / math.sqrt(10.0 ** ((cfg.noise_dbm - 30.0) / 10.0))
