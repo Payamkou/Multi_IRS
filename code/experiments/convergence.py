@@ -149,11 +149,25 @@ def _wsr_per_layer(model, ch, theta0, device, chunk: int = 250) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- experiment 1/2
+def cache_spec(cfg: Config, exp: str = "convergence") -> tuple:
+    """(npz path, cfg-hash keys, extra fingerprint files, extra npz keys or None) of exp_01
+    ("convergence"); shared by run_convergence and report.py."""
+    if exp != "convergence":
+        raise KeyError(exp)
+    return os.path.join(cfg.root, "results", "exp_01_convergence.npz"), EXP_KEYS, [], None
+
+
+def is_cached(cfg: Config) -> bool:
+    path, keys, files, extra = cache_spec(cfg)
+    return check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=files), extra)
+
+
 def run_convergence(cfg: Config, force_rerun: bool = False) -> Path:
     """Per-layer WSR (all test samples) and CPU batch-1 timings; cached as exp_01_convergence.npz."""
-    path = os.path.join(_results_dir(cfg), "exp_01_convergence.npz")
-    fpr = artifact_fingerprint(cfg)
-    if not force_rerun and check_cache(path, cfg, EXP_KEYS, fpr):
+    _results_dir(cfg)
+    path, keys, files, extra = cache_spec(cfg)
+    fpr = artifact_fingerprint(cfg, extra=files)
+    if not force_rerun and check_cache(path, cfg, keys, fpr, extra):
         return Path(path)
 
     d = data.build_or_load(cfg, "test")

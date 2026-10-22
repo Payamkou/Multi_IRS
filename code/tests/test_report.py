@@ -248,6 +248,85 @@ def test_verdicts_on_synthetic():
         assert c.tolerance and c.section and c.figure and c.text, c.id
 
 
+def test_approx_claims_sign_and_direction_tags():
+    import report
+    claims = report.make_claims(Config())
+
+    def ev(cid, src, key, v):
+        return report.evaluate_claim(_claim(claims, cid), {src: {key: v}})[1:]
+
+    # p95 <= 0: the method beats AO on >= 95% of samples -> sign inverted, never "Partly"
+    assert ev("cdf_p95_fonr", "convergence", "gap_p95_fonr", -0.3) == \
+        (report.CONTRADICTED, "sign inverted: method beats AO")
+    assert ev("cdf_p95_fonr", "convergence", "gap_p95_fonr", 0.0) == (report.PARTLY, "below claimed")
+    assert ev("cdf_p95_fonr", "convergence", "gap_p95_fonr", 0.01) == (report.PARTLY, "below claimed")
+    assert ev("cdf_p95_fonr", "convergence", "gap_p95_fonr", 0.09) == (report.CONFIRMED, "above claimed")
+    assert ev("cdf_p95_fonr", "convergence", "gap_p95_fonr", 0.15) == (report.PARTLY, "above claimed")
+    # MASO left tail ≈ -2
+    assert ev("cdf_maso_left_tail_minus2", "convergence", "gap_min_maso", -10.0) == \
+        (report.CONTRADICTED, "below claimed")
+    assert ev("cdf_maso_left_tail_minus2", "convergence", "gap_min_maso", -2.5) == (report.CONFIRMED, "below claimed")
+    assert ev("cdf_maso_left_tail_minus2", "convergence", "gap_min_maso", -4.0) == (report.PARTLY, "below claimed")
+    assert ev("cdf_maso_left_tail_minus2", "convergence", "gap_min_maso", 0.3) == \
+        (report.CONTRADICTED, "sign inverted: MASO never beats AO")
+    # range claims carry a direction tag too
+    assert ev("wall_ao_conv_explicit", "convergence", "ao_conv_time_ms_explicit", 20.0) == \
+        (report.PARTLY, "above claimed")
+    assert ev("wall_ao_conv_explicit", "convergence", "ao_conv_time_ms_explicit", 8.0) == \
+        (report.CONFIRMED, "within claimed range")
+
+
+def test_nan_error_and_not_run_verdicts():
+    import report
+    claims = report.make_claims(Config())
+    # NaN measurement -> Not run (input unusable), not Contradicted
+    m, v, _ = report.evaluate_claim(_claim(claims, "cdf_p95_fonr"), {"convergence": {"gap_p95_fonr": float("nan")}})
+    assert v == report.NOT_RUN
+    # ...except where NaN is a real outcome: "never reached 98%" is Contradicted
+    _, v, _ = report.evaluate_claim(_claim(claims, "wall_tias_98pct_085ms"),
+                                    {"convergence": {"time_to_98pct_tias_ms": float("nan")}})
+    assert v == report.CONTRADICTED
+    # an exception inside verdict_fn is reported as an error, never as Contradicted
+    c = _claim(claims, "rtM_maso_approx_fonr")
+    S = {"runtime_M": {k.split(":", 1)[1]: 0.0 for k in c.measured_key}}
+    _, v, _ = report.evaluate_claim(c, S)
+    assert v == "Error: ZeroDivisionError"
+    # K-sweep latency claim split: nets only (body) and all methods (Fig. 7 caption)
+    _claim(claims, "K_tias_lowest_net")
+    assert _claim(claims, "K_tias_lowest_all").figure == "Fig. 7 caption"
+
+
+def test_report_and_producers_share_cache_spec(synth, monkeypatch):
+    from experiments import sweeps
+    monkeypatch.setattr(sw, "_fig", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    runs = {"runtime_M": sw.run_runtime_vs_M, "power": sw.run_power_sweep, "wsr_K": sw.run_wsr_vs_K,
+            "runtime_K": sw.run_runtime_vs_K, "zeroshot_M": sw.run_zeroshot_M, "gpu": sw.run_gpu_timing}
+    for exp, fn in runs.items():
+        p, s = fn(synth)
+        assert os.path.samefile(p, sweeps.cache_spec(synth, exp)[0]), exp
+        assert sweeps.is_cached(synth, exp), exp
+        assert s == sweeps.summarize(synth, exp, sweeps.cache_spec(synth, exp)[0]), exp
+    assert os.path.exists(cv.cache_spec(synth)[0]) and cv.is_cached(synth)
+    import report
+    import inspect
+    src = inspect.getsource(report)
+    for private in ("_summ_wsr", "_summ_runtime", "_step_times", "_ds("):
+        assert private not in src, private
+
+
+def test_provenance_flags_inconsistent_ao_cap(synth):
+    import report
+    md = report.build_report(synth).read_text(encoding="utf-8")
+    assert "shared-config hash" in md and "Consistency: all sources share" in md
+    p = os.path.join(synth.root, "results", "exp_06_wsr_vs_K.npz")
+    z = dict(np.load(p))
+    z["ao_baseline_max_iter"] = np.int64(1000)
+    np.savez(p, **z)
+    md = report.build_report(synth).read_text(encoding="utf-8")
+    assert "WARNING: ao_baseline_max_iter differs between sources" in md
+
+
 def test_every_claim_has_measurement_key_in_summaries(synth, monkeypatch):
     import report
     S = producer_summaries(synth, monkeypatch)

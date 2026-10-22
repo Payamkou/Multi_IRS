@@ -85,6 +85,8 @@ class Claim:
     suggestion: str = ""          # may use {m} (measured, formatted) and {ao} (baseline label)
     note_key: tuple = ()          # shown next to the measurement, never used for the verdict
     text_section: str = "VI"      # main.tex section the suggested edit goes to
+    tag_fn: Optional[Callable[[dict], str]] = None  # direction tag for approximate claims
+    nan_ok: bool = False          # True: NaN is a real outcome (e.g. "never reached"), not a missing input
 
 
 def _nan(v) -> bool:
@@ -92,14 +94,46 @@ def _nan(v) -> bool:
 
 
 def _v_approx(k, x, partly_mult=2.5):
-    """'≈ x': Confirmed if |m − x| ≤ 0.5|x|; Partly if m ≤ partly_mult·x; else Contradicted."""
+    """'≈ x' (x ≠ 0): Confirmed if |m − x| ≤ 0.5|x|; Partly if m has the sign of x (m = 0 counts) and
+    |m| ≤ partly_mult·|x| (i.e. 0 ≤ m/x < 0.5 or 1.5 < m/x ≤ partly_mult); otherwise Contradicted
+    (an inverted sign is always Contradicted)."""
+    def f(m):
+        v = float(m[k])
+        if abs(v - x) <= 0.5 * abs(x):
+            return CONFIRMED
+        r = v / x
+        return PARTLY if 0 <= r <= partly_mult else CONTRADICTED
+    return f
+
+
+def _tag_point(k, x, inverted="sign inverted"):
+    """Direction tag of an approximate claim '≈ x'."""
     def f(m):
         v = float(m[k])
         if math.isnan(v):
-            return CONTRADICTED
-        if abs(v - x) <= 0.5 * abs(x):
-            return CONFIRMED
-        return PARTLY if v <= partly_mult * x else CONTRADICTED
+            return ""
+        if v / x < 0:
+            return inverted
+        if abs(v - x) <= 1e-12 * max(1.0, abs(x)):
+            return "as claimed"
+        return "below claimed" if v < x else "above claimed"
+    return f
+
+
+def _tag_range(klo, khi, lo, hi):
+    """Direction tag of an approximate range claim 'lo–hi' (klo/khi may be the same key)."""
+    def f(m):
+        a, b = float(m[klo]), float(m[khi])
+        if math.isnan(a) or math.isnan(b):
+            return ""
+        if a >= lo and b <= hi:
+            return "within claimed range"
+        parts = []
+        if a < lo:
+            parts.append("below claimed")
+        if b > hi:
+            parts.append("above claimed")
+        return " and ".join(parts)
     return f
 
 
@@ -212,7 +246,8 @@ def make_claims(cfg: Config) -> list:
         for n in NETS:
             k = cv(f"recovery_pct_layer{l}_{n}")
             fn = kind(k, x, 5.0, 15.0) if kind is _v_pp else kind(k, x)
-            add(id=f"conv_recovery_l{l}_{n}", section="VI-B", figure="Fig. 1",
+            add(tag_fn=_tag_point(k, x) if kind is _v_pp else None,
+                id=f"conv_recovery_l{l}_{n}", section="VI-B", figure="Fig. 1",
                 text=f"{NET[n]} recovers {phr} of the steady-state WSR gain by layer {l}", measured_key=(k,),
                 verdict_fn=fn,
                 tolerance=f"recovery = 100·(R̄_{l} − R̄_0)/(R̄_AO − R̄_0) vs the converged AO baseline; {tol}",
@@ -238,7 +273,7 @@ def make_claims(cfg: Config) -> list:
     k98, k99 = cv("time_to_98pct_tias_ms"), cv("time_to_99pct_tias_ms")
     add(id="wall_tias_98pct_085ms", section="VI-B", figure="Fig. 2",
         text="TIAS reaches ≈98% of AO's converged WSR within ≈0.85 ms", measured_key=(k98,),
-        verdict_fn=_v_time_within(k98, 0.85),
+        verdict_fn=_v_time_within(k98, 0.85), nan_ok=True, tag_fn=_tag_point(k98, 0.85),
         tolerance="mean cumulative CPU time at the first layer with mean WSR ≥ 0.98·AO mean: Confirmed if "
                   "≤ 1.5·0.85 ms; Partly if ≤ 3·0.85 ms; never reached → Contradicted",
         suggestion="Sec. VI-B: replace '≈0.85 ms' by the measured time to 98% ({m} ms; NaN = never reached at "
@@ -253,14 +288,14 @@ def make_claims(cfg: Config) -> list:
             return CONFIRMED if t <= a else PARTLY if t <= 2 * a else CONTRADICTED
         add(id=f"wall_tias98_within_first_ao_iter_{mode}", section="VI-B", figure="Fig. 2",
             text=f"TIAS's 98% time is within the budget AO ({mode}) needs to complete its first phase-shift update",
-            measured_key=(k98, ka), verdict_fn=first,
+            measured_key=(k98, ka), verdict_fn=first, nan_ok=True,
             tolerance=f"AO first-update time taken as the mean per-iteration time of the first L iterations at "
                       f"M = {M0} (Fig. 4 data); Confirmed if t98(TIAS) ≤ t_iter(AO); Partly if ≤ 2·t_iter",
             suggestion=f"Sec. VI-B: compare TIAS's time to 98% with the measured AO ({mode}) per-iteration time "
                        "({m}).")
     add(id="wall_tias_99pct_1ms", section="VI-B", figure="Fig. 2",
         text="TIAS crosses 99% of AO's converged WSR by ≈1 ms", measured_key=(k99,),
-        verdict_fn=_v_time_within(k99, 1.0),
+        verdict_fn=_v_time_within(k99, 1.0), nan_ok=True, tag_fn=_tag_point(k99, 1.0),
         tolerance="Confirmed if ≤ 1.5 ms; Partly if ≤ 3 ms; never reached → Contradicted",
         suggestion="Sec. VI-B: replace '≈1 ms' by the measured time to 99% ({m} ms; NaN = never reached at L = 10).")
     for mode in AO_MODES:
@@ -274,7 +309,7 @@ def make_claims(cfg: Config) -> list:
             return CONFIRMED if r >= 5 else PARTLY if r > 1 else CONTRADICTED
         add(id=f"wall_tias99_order_before_ao_{mode}", section="VI-B", figure="Fig. 2",
             text=f"TIAS crosses 99% nearly an order of magnitude before AO ({mode}) converges",
-            measured_key=(k99, kc), verdict_fn=order,
+            measured_key=(k99, kc), verdict_fn=order, nan_ok=True,
             tolerance="ratio t_conv(AO)/t99(TIAS): 'nearly an order of magnitude' → Confirmed if ≥ 5; Partly if > 1",
             suggestion=f"Sec. VI-B: state the measured ratio of AO ({mode}) convergence time to TIAS's 99% time "
                        "({m}).")
@@ -282,6 +317,7 @@ def make_claims(cfg: Config) -> list:
         kc = cv(f"ao_conv_time_ms_{mode}")
         add(id=f"wall_ao_conv_{mode}", section="VI-B", figure="Fig. 2",
             text=f"AO ({mode}) converges at ≈7.9–8.8 ms", measured_key=(kc,), verdict_fn=_v_range(kc, 7.9, 8.8),
+            tag_fn=_tag_range(kc, kc, 7.9, 8.8),
             tolerance="mean CPU time to the stopping rule: Confirmed if within [0.5·7.9, 1.5·8.8] ms; Partly if "
                       "within [7.9/3, 3·8.8] ms",
             suggestion=f"Sec. VI-B: replace '≈7.9–8.8 ms' by the measured AO ({mode}) convergence time ({{m}} ms) "
@@ -307,7 +343,10 @@ def make_claims(cfg: Config) -> list:
         k = cv(f"gap_p95_{n}")
         add(id=f"cdf_p95_{n}", section="VI-B", figure="Fig. 3",
             text=f"95th-percentile gap ≈ {x} bps/Hz for {NET[n]}", measured_key=(k,), verdict_fn=_v_approx(k, x),
-            tolerance=f"Confirmed if |m − {x}| ≤ {0.5 * x:.3g}; Partly if m ≤ {2.5 * x:.3g}; else Contradicted",
+            tag_fn=_tag_point(k, x, "sign inverted: method beats AO"),
+            tolerance=f"Confirmed if |m − {x}| ≤ {0.5 * x:.3g}; Partly if 0 ≤ m < {0.5 * x:.3g} or "
+                      f"{1.5 * x:.3g} < m ≤ {2.5 * x:.3g}; otherwise Contradicted (m < 0: sign inverted, the "
+                      "method beats AO on ≥ 95% of samples)",
             note_key=(cv(f"gap_p95_{n}_vs1000"),),
             suggestion=f"Sec. VI-B: replace '{x} bps/Hz for {NET[n]}' by the measured 95th-percentile gap {{m}} "
                        "bps/Hz (vs {ao}; the AO-1000 reference value is listed in Sec. 1).")
@@ -330,12 +369,11 @@ def make_claims(cfg: Config) -> list:
                    "'tightly concentrated around 0'.")
     k = cv("gap_min_maso")
 
-    def tail(m, k=k):
-        v = float(m[k])
-        return CONFIRMED if abs(v + 2) <= 1 else PARTLY if v <= -0.5 else CONTRADICTED
     add(id="cdf_maso_left_tail_minus2", section="VI-B", figure="Fig. 3",
-        text="MASO's left tail reaches ΔR ≈ −2 bps/Hz", measured_key=(k,), verdict_fn=tail,
-        tolerance="minimum gap: Confirmed if |m + 2| ≤ 1; Partly if m ≤ −0.5; else Contradicted",
+        text="MASO's left tail reaches ΔR ≈ −2 bps/Hz", measured_key=(k,), verdict_fn=_v_approx(k, -2.0),
+        tag_fn=_tag_point(k, -2.0, "sign inverted: MASO never beats AO"),
+        tolerance="minimum gap: Confirmed if |m + 2| ≤ 1; Partly if −5 ≤ m < −3 or −1 < m ≤ 0; otherwise "
+                  "Contradicted (m > 0: sign inverted)",
         note_key=(cv("gap_min_maso_vs1000"),),
         suggestion="Sec. VI-B: replace 'ΔR ≈ −2 bps/Hz' by MASO's measured minimum gap ({m} bps/Hz vs {ao}).")
     kmin = tuple(cv(f"gap_min_{n}") for n in NETS)
@@ -432,6 +470,7 @@ def make_claims(cfg: Config) -> list:
             return PARTLY if a >= 98 and b <= 102 else CONTRADICTED
         add(id=f"pow_eta_range_{n}", section="VI-D", figure="Fig. 5",
             text=f"η_WSR stays within {lo}–{hi}% for {NET[n]} over 20–45 dBm", measured_key=(kl, kh), verdict_fn=rng,
+            tag_fn=_tag_range(kl, kh, lo, hi),
             tolerance=f"η = ratio of means (spec §7): Confirmed if [min, max] ⊂ [{lo - 0.5:.1f}, {hi + 0.5:.1f}]; "
                       "Partly if ⊂ [98, 102] ('within about one percentage point', doubled)",
             suggestion=f"Sec. VI-D: replace '{lo}–{hi}% for {NET[n]}' by the measured range {{m}} (ratio of means vs "
@@ -483,14 +522,20 @@ def make_claims(cfg: Config) -> list:
                 float(m[kg[1]]) / float(m[kg[0]])),
             tolerance=f"growth t(K={max(Ks)})/t(K={min(Ks)}): Confirmed if ≥ 1.2 ('noticeably'); Partly if > 1.05",
             suggestion=f"Sec. VI-E: AO ({mode}) latency barely grows with K ({{m}}); revise the sentence.")
+    kk = keys_all(NETS, Ks, rtK)
+    add(id="K_tias_lowest_net", section="VI-E", figure="Fig. 7",
+        text="among the unfolded schemes, TIAS achieves the lowest absolute latency (every K)", measured_key=kk,
+        verdict_fn=lambda m: _frac(float(m[rtK("tias", K)]) < min(float(m[rtK(x, K)]) for x in ("fonr", "maso"))
+                                   for K in Ks),
+        tolerance="per K: t_TIAS < min(t_FONR, t_MASO); Confirmed at every K, Partly at ≥ half",
+        suggestion="Sec. VI-E: TIAS is not the fastest unfolded scheme at every K ({m}); state the measured ordering.")
     kk = keys_all(TIME_METHODS, Ks, rtK)
-    add(id="K_tias_lowest_latency", section="VI-E", figure="Fig. 7",
-        text="TIAS achieves the lowest absolute latency at every K", measured_key=kk,
+    add(id="K_tias_lowest_all", section="VI-E", figure="Fig. 7 caption",
+        text="TIAS maintains the lowest latency profile (of all methods, FP-AO included)", measured_key=kk,
         verdict_fn=lambda m: _frac(float(m[rtK("tias", K)]) < min(float(m[rtK(x, K)]) for x in TIME_METHODS if x != "tias")
                                    for K in Ks),
         tolerance="per K: t_TIAS < every other method (both AO modes included); Confirmed at every K, Partly at ≥ half",
-        suggestion="Sec. VI-E and Fig. 7 caption: TIAS is not the fastest at every K ({m}); state the measured "
-                   "ordering.")
+        suggestion="Fig. 7 caption: TIAS does not have the lowest latency of all methods at every K ({m}).")
     kg = tuple(rtK(m, x) for m in ("tias", "ao_explicit", "ao_efficient") for x in (min(Ks), max(Ks)))
 
     def gentle(m):
@@ -559,14 +604,31 @@ def measure(claim: Claim, S: dict) -> Optional[dict]:
     return out
 
 
+def _has_nan(m: dict) -> bool:
+    for v in m.values():
+        vals = v if isinstance(v, (tuple, list)) else (v,)
+        if any(isinstance(x, (float, np.floating)) and math.isnan(x) for x in vals):
+            return True
+    return False
+
+
 def evaluate_claim(claim: Claim, S: dict) -> tuple:
+    """(measured dict or None, verdict, direction tag). Missing input or NaN (unless ``nan_ok``) →
+    NOT_RUN; an exception inside verdict_fn → "Error: <type>" (never silently Contradicted)."""
     m = measure(claim, S)
-    if m is None:
-        return None, NOT_RUN
+    if m is None or (not claim.nan_ok and _has_nan(m)):
+        return m, NOT_RUN, ""
     try:
-        return m, claim.verdict_fn(m)
-    except (ZeroDivisionError, TypeError, ValueError):
-        return m, CONTRADICTED
+        v = claim.verdict_fn(m)
+    except Exception as e:  # noqa: BLE001 - reported, not hidden
+        return m, f"Error: {type(e).__name__}", ""
+    tag = ""
+    if claim.tag_fn is not None:
+        try:
+            tag = claim.tag_fn(m)
+        except Exception:  # noqa: BLE001
+            tag = ""
+    return m, v, tag
 
 
 # ================================================================ inputs
@@ -585,83 +647,51 @@ def _read_json(path):
         return json.load(f)
 
 
-def _power_summary(z, pts) -> dict:
-    from experiments import sweeps as sw
-    s = sw._summ_wsr(z, "P", pts, eta_prefix="eta_ratio_of_means_")
-    for n in NETS:
-        rom = [float(z[f"eta_ratio_of_means_{n}_P{P}"]) for P in pts]
-        for P in pts:
-            s[f"eta_mean_of_ratios_{n}_P{P}"] = float(z[f"eta_mean_of_ratios_{n}_P{P}"])
-        s[f"eta_range_{n}"] = (min(rom), max(rom))
-        s[f"eta_min_{n}"], s[f"eta_max_{n}"] = min(rom), max(rom)
-    return s
-
-
-def _gpu_summary(z, Ms, Ks) -> dict:
-    from experiments import sweeps as sw
-    s = {"gpu_available": 1.0}
-    s.update(sw._summ_runtime(z, "M", Ms))
-    s.update(sw._summ_runtime(z, "K", Ks))
-    for m in TIME_METHODS:
-        s[f"step_time_ms_{m}"] = float(1e3 * np.nanmean(sw._step_times(z, m)))
-    for mode in AO_MODES:
-        s[f"ao_conv_time_ms_{mode}"] = float(1e3 * np.nanmean(z[f"ao_cumtime_{mode}"]))
-        s[f"ao_conv_n_failed_{mode}"] = float(np.isnan(z[f"ao_cumtime_{mode}"]).sum())
-    return s
+def _shared_hash(cfg_json: str) -> str:
+    """Hash of the config fields every experiment must share (training + AO rule), from a stored cfg_json."""
+    import train
+    keys = train.TRAIN_KEYS + ("ao_tol", "ao_max_iter")
+    return config_hash(Config.from_dict(json.loads(cfg_json)), keys)
 
 
 def collect_summaries(cfg: Config, check: bool = True) -> tuple:
     """(summaries {source: dict}, status {source: "ok" | "not run" | "stale"}) from the cached result
-    files; never runs an experiment. Extra sources: "ao_ref" (capped fractions), "meta" (strings)."""
+    files; never runs an experiment. The cache rule (path, hash keys, fingerprint files) and the
+    summary functions are the producers' own (``convergence.cache_spec`` / ``sweeps.cache_spec``,
+    ``summarize_convergence`` / ``sweeps.summarize``), so they cannot drift.
+    Extra sources: "ao_ref" (capped fractions), "meta" (strings, incl. per-source provenance)."""
     from experiments import convergence as cv
     from experiments import sweeps as sw
     from experiments.cache import artifact_fingerprint, check_cache
 
-    res = os.path.join(cfg.root, "results")
-    S, status = {"meta": {}}, {}
-
-    def load(src, keys, files=(), extra=None):
-        p = os.path.join(res, SRC_FILES[src])
-        if not os.path.exists(p):
+    S, status = {"meta": {"provenance": {}}}, {}
+    for src in SRC_FILES:
+        path, keys, files, extra = cv.cache_spec(cfg) if src == "convergence" else sw.cache_spec(cfg, src)
+        if not os.path.exists(path):
             status[src] = "not run"
-            return None
-        if check and not check_cache(p, cfg, keys, artifact_fingerprint(cfg, extra=list(files)), extra):
+            continue
+        z = _load_npz(path)
+        prov = {"cfg_hash": str(z.get("cfg_hash", "")),
+                "ao_baseline_max_iter": (int(z["ao_baseline_max_iter"]) if "ao_baseline_max_iter" in z else None)}
+        try:
+            prov["shared_hash"] = _shared_hash(str(z["cfg_json"]))
+        except (KeyError, ValueError, TypeError):
+            prov["shared_hash"] = None
+        S["meta"]["provenance"][src] = prov
+        if check and not check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=files), extra):
             status[src] = "stale"
-            return None
+            continue
         status[src] = "ok"
-        return _load_npz(p)
-
-    Ms, Ks, Ps = tuple(cfg.sweep_M), tuple(cfg.sweep_K), tuple(cfg.sweep_crn_dbm)
-    cpu = {"device": "cpu", "cdtype": "complex128"}
-    z = load("convergence", cv.EXP_KEYS)
-    if z is not None:
-        S["convergence"] = cv.summarize_convergence(z)
-        cap = float(z["ao_baseline_max_iter"])
-        S["ao_ref"] = {"frac_capped_baseline": float(np.mean(z["n_iter_ao100"] >= cap)),
-                       "frac_capped_1000": float(np.mean(z["n_iter_ao1000"] >= 1000)),
-                       "n_capped_baseline": float(np.sum(z["n_iter_ao100"] >= cap))}
-    z = load("runtime_M", sw.TIME_KEYS + ("sweep_M",), sw._ds("sweep_M", Ms), cpu)
-    if z is not None:
-        S["runtime_M"] = sw._summ_runtime(z, "M", Ms)
-    z = load("power", sw.WSR_KEYS + ("sweep_crn_dbm",), sw._ds("sweep_power", Ps))
-    if z is not None:
-        S["power"] = _power_summary(z, Ps)
-    z = load("wsr_K", sw.WSR_KEYS + ("sweep_K",), sw._ds("sweep_K", Ks))
-    if z is not None:
-        S["wsr_K"] = sw._summ_wsr(z, "K", Ks)
-    z = load("runtime_K", sw.TIME_KEYS + ("sweep_K",), sw._ds("sweep_K", Ks), cpu)
-    if z is not None:
-        S["runtime_K"] = sw._summ_runtime(z, "K", Ks)
-    zp = sw.zeroshot_points(cfg)
-    z = load("zeroshot_M", sw.WSR_KEYS + ("zeroshot_M",), sw._ds("sweep_M", zp))
-    if z is not None:
-        S["zeroshot_M"] = sw._summ_wsr(z, "M", zp, suffix="_zeroshot")
-        S["zeroshot_M"]["M_reference"] = float(z["M_reference"])
-    files = sw._ds("sweep_M", Ms) + sw._ds("sweep_K", Ks) + ["datasets/test.pt"]
-    z = load("gpu", sw.TIME_KEYS + ("sweep_M", "sweep_K", "ao_tol", "ao_max_iter"), files)
-    if z is not None:
-        S["gpu"] = _gpu_summary(z, Ms, Ks)
-        S["meta"]["gpu_name"] = str(z.get("gpu_name", "unknown GPU"))
+        if src == "convergence":
+            S[src] = cv.summarize_convergence(z)
+            cap = float(z["ao_baseline_max_iter"])
+            S["ao_ref"] = {"frac_capped_baseline": float(np.mean(z["n_iter_ao100"] >= cap)),
+                           "frac_capped_1000": float(np.mean(z["n_iter_ao1000"] >= 1000)),
+                           "n_capped_baseline": float(np.sum(z["n_iter_ao100"] >= cap))}
+        else:
+            S[src] = sw.summarize(cfg, src, z)
+        if src == "gpu":
+            S["meta"]["gpu_name"] = str(z.get("gpu_name", "unknown GPU"))
     rows = load_artifacts(cfg)["final_rows"]
     if rows:
         S["final"] = final_summary(rows)
@@ -924,6 +954,14 @@ DEVIATIONS = [
               "Unit test (spec §9.1): the matrix-free gradient g_n = v_n − A_n φ_n equals the autograd Wirtinger "
               "gradient of f₃ only with h_{d,i}.",
               suggestion="Sec. III, v_n: replace h*_{d,i} by h_{d,i}; Sec. IV (TIAS): write H_k = h_{d,k} + ψ_k."),
+    Deviation("safe_sqrt_sinr", "Numerically safe √(w̃p) and masked-interference SINR in fp_core",
+              "Sec. III / IV (not specified; implementation)", "III",
+              "√(w̃_k p_k) uses a safe square root with a finite (zero) gradient at p = 0, and the SINR interference "
+              "term is computed by masking the user's own signal instead of D − p_k|H_k|².",
+              "complex64 training produced NaN gradients from √ at p = 0, and the D − S subtraction loses precision "
+              "(~1e-5 relative in complex64). Mathematically identical; applied to AO and all three nets.",
+              "Build-time measurement (ledger, Task 9): AO outputs changed by ≤ 3e-15 (rounding level), so the "
+              "teacher labels stayed valid."),
     Deviation("ln_log2", "Natural log in the Lagrangian dual / quadratic transforms",
               "Sec. III (f₁)", "III",
               "All transforms and surrogates use ln; reported WSR stays Σ w_k log₂(1+γ_k).",
@@ -959,9 +997,10 @@ DEVIATIONS = [
               "user decides the baseline after the full run (cfg.ao_max_iter is the switch, and the teacher labels "
               "are regenerated when it changes).",
               "Experiment design is binding (spec §3); hiding an under-converged baseline would be a strawman.",
-              "Build-time measurement (ledger, validation split): 528/1000 samples capped at 100 iterations; 1000 "
-              "iterations gave +6.5 % mean WSR; untrained TIAS (4.359) and MASO (4.306) already exceeded AO-100 "
-              "(3.980) and AO-1000 (4.238).",
+              "Build-time measurement of the AO-100 (Table I rule) baseline, validation split, recorded in the "
+              "build ledger before training (these numbers describe AO-100, whatever baseline this report uses): "
+              "528/1000 samples stopped by the 100-iteration cap; 1000 iterations gave +6.5 % mean WSR; untrained "
+              "TIAS (4.359) and MASO (4.306) already exceeded AO-100 (3.980) and AO-1000 (4.238).",
               evidence_fn=_ev_ao_cap,
               suggestion="Sec. VI-A/B: state that FP-AO with a 100-iteration cap is not converged on a large share of "
                          "samples, report the gap also against a long-run AO, and interpret ΔR < 0 accordingly."),
@@ -1111,19 +1150,36 @@ def _section_inputs(cfg, S, status, art) -> list:
     rows.append(["FONR μ0", "logs/fonr_mu_init.json", "ok" if art["fonr_mu"] else "not run"])
     for n in NETS:
         rows.append([f"{NET[n]} LR pilot", f"logs/{n}_lr_pilot.csv", "ok" if n in art["pilots"] else "not run"])
+    prov = S.get("meta", {}).get("provenance", {})
+    prow = [[src, (p["cfg_hash"] or "")[:12], _fmt(p["ao_baseline_max_iter"]),
+             (p["shared_hash"] or "?")[:12]] for src, p in prov.items()]
+    shared = {p["shared_hash"] for p in prov.values() if p["shared_hash"]}
+    iters = {p["ao_baseline_max_iter"] for p in prov.values() if p["ao_baseline_max_iter"] is not None}
+    flags = []
+    if len(shared) > 1:
+        flags.append("**WARNING: the result files were produced with different training/AO configurations "
+                     "(shared-config hash differs between sources).**")
+    if len(iters) > 1:
+        flags.append(f"**WARNING: ao_baseline_max_iter differs between sources: {sorted(iters)}.**")
     out = [SECTION_HEADINGS[1], "",
            f"AO baseline: **{ao_label(S, cfg)}** (ΔR/R < {cfg.ao_tol:g} or {ao_label(S, cfg)[3:]} iterations). "
            "'stale' = the result file no longer matches the config/artifacts and is not used.", "",
            _table(["input", "file", "status"], rows), ""]
+    if prow:
+        out += ["Per-source provenance. cfg_hash covers each experiment's own key set, so it differs between "
+                "experiments by design; the shared-config hash covers the fields every experiment must agree on "
+                "(training config + AO rule).", "",
+                _table(["source", "cfg_hash", "ao_baseline_max_iter", "shared-config hash"], prow), ""]
+        out += (flags or ["Consistency: all sources share the same training/AO configuration and AO cap."]) + [""]
     return out
 
 
 def _section_claims(cfg, S, ao) -> tuple:
     claims = make_claims(cfg)
-    rows, results, counts = [], [], {CONFIRMED: 0, PARTLY: 0, CONTRADICTED: 0, NOT_RUN: 0}
+    rows, results, counts = [], [], {CONFIRMED: 0, PARTLY: 0, CONTRADICTED: 0, NOT_RUN: 0, "Error": 0}
     for c in claims:
-        m, v = evaluate_claim(c, S)
-        counts[v] += 1
+        m, v, tag = evaluate_claim(c, S)
+        counts[v if v in counts else "Error"] += 1
         note = ""
         if c.note_key and ao != "AO-1000":
             nm = {}
@@ -1132,11 +1188,12 @@ def _section_claims(cfg, S, ao) -> tuple:
                 nm[k] = _g(S, src, key)
             if all(x is not None for x in nm.values()):
                 note = "vs AO-1000: " + _fmt_measured(nm)
-        rows.append([f"`{c.id}`", c.section, c.figure, c.text, c.tolerance, _fmt_measured(m), note, f"**{v}**"])
-        results.append((c, m, v))
+        cell = f"**{v}**" + (f" ({tag})" if tag else "")
+        rows.append([f"`{c.id}`", c.section, c.figure, c.text, c.tolerance, _fmt_measured(m), note, cell])
+        results.append((c, m, v, tag))
     out = [SECTION_HEADINGS[2], "",
            f"Verdicts: {counts[CONFIRMED]} {CONFIRMED}, {counts[PARTLY]} {PARTLY}, {counts[CONTRADICTED]} "
-           f"{CONTRADICTED}, {counts[NOT_RUN]} {NOT_RUN} (of {len(claims)}). Tolerances are derived from each claim's "
+           f"{CONTRADICTED}, {counts[NOT_RUN]} {NOT_RUN}, {counts['Error']} Error (of {len(claims)}). Tolerances are derived from each claim's "
            "own wording and were fixed before any result existed.", "",
            _table(["ID", "Sec.", "Fig.", "Claim (main.tex)", "Tolerance", f"Measured (baseline {ao})",
                    "Note", "Verdict"], rows), ""]
@@ -1312,20 +1369,24 @@ def _section_suggestions(results, ao) -> list:
     out = [SECTION_HEADINGS[8], "",
            "Generated from the Contradicted / Partly confirmed claims and from the deviations. The authors decide; "
            "main.tex is not edited.", ""]
-    not_run = [c.id for c, _, v in results if v == NOT_RUN]
+    not_run = [c.id for c, _, v, _ in results if v == NOT_RUN]
+    errors = [f"`{c.id}` ({v})" for c, _, v, _ in results if v.startswith("Error")]
     for sec in ("III", "IV", "VI"):
         out += [f"### Sec. {sec}", ""]
         items = []
-        for c, m, v in results:
+        for c, m, v, tag in results:
             if c.text_section == sec and v in (CONTRADICTED, PARTLY):
-                items.append(f"- [`{c.id}`, {v}] {c.figure}: \"{c.text}\" — measured {_fmt_measured(m)}. "
+                vt = v + (f", {tag}" if tag else "")
+                items.append(f"- [`{c.id}`, {vt}] {c.figure}: \"{c.text}\" — measured {_fmt_measured(m)}. "
                              f"Suggested: {c.suggestion.format(m=_fmt_measured(m, 4), ao=ao)}")
         for d in DEVIATIONS:
             if d.section == sec and d.suggestion:
                 items.append(f"- [deviation: {d.title}] {d.suggestion}")
         out += (items or ["- No change suggested by the measured results."]) + [""]
+    if errors:
+        out += ["Claims whose verdict raised an error (check the inputs): " + ", ".join(errors) + ".", ""]
     if not_run:
-        out += ["Claims not evaluated (inputs not run): " + ", ".join(f"`{i}`" for i in not_run) + ".", ""]
+        out += ["Claims not evaluated (inputs not run or NaN): " + ", ".join(f"`{i}`" for i in not_run) + ".", ""]
     return out
 
 

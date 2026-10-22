@@ -257,19 +257,98 @@ def _load(p):
 
 
 # ---------------------------------------------------------------- runtime experiments (4, 7)
-def _run_runtime(cfg, exp, split, points, tag, sweep_key, device, cdtype, force_rerun, plot_fn, fig_name):
+# ---------------------------------------------------------------- shared cache specs / summaries
+# exp -> (file stem, dataset split, points(cfg), tag, sweep config key); used by run_* AND report.py
+EXPERIMENTS = {
+    "runtime_M": ("exp_04_runtime_vs_M", "sweep_M", lambda c: tuple(c.sweep_M), "M", "sweep_M"),
+    "runtime_K": ("exp_07_runtime_vs_K", "sweep_K", lambda c: tuple(c.sweep_K), "K", "sweep_K"),
+    "power": ("exp_05_power_sweep", "sweep_power", lambda c: tuple(c.sweep_crn_dbm), "P", "sweep_crn_dbm"),
+    "wsr_K": ("exp_06_wsr_vs_K", "sweep_K", lambda c: tuple(c.sweep_K), "K", "sweep_K"),
+    "zeroshot_M": ("exp_08_zeroshot_M", "sweep_M", lambda c: zeroshot_points(c), "M", "zeroshot_M"),
+}
+GPU_EXP = "gpu"
+GPU_KEYS = TIME_KEYS + ("sweep_M", "sweep_K", "ao_tol", "ao_max_iter")
+
+
+def cache_spec(cfg: Config, exp: str, device: str = "cpu", cdtype=C128) -> tuple:
+    """(npz path, cfg-hash keys, extra fingerprint files, extra npz keys or None) of experiment ``exp``
+    (a key of EXPERIMENTS or "gpu"). The single source of the cache rule for run_* and report.py."""
+    res = os.path.join(cfg.root, "results")
+    if exp == GPU_EXP:
+        files = _ds("sweep_M", cfg.sweep_M) + _ds("sweep_K", cfg.sweep_K) + ["datasets/test.pt"]
+        return os.path.join(res, "exp_supp_gpu_timing.npz"), GPU_KEYS, files, None
+    stem, split, pts, _, sweep_key = EXPERIMENTS[exp]
+    files = _ds(split, pts(cfg))
+    if exp.startswith("runtime_"):
+        if not (torch.device(device).type == "cpu" and cdtype == C128):
+            stem = f"{stem}_{torch.device(device).type}_{_cname(cdtype)}"
+        return (os.path.join(res, stem + ".npz"), TIME_KEYS + (sweep_key,), files,
+                {"device": str(device), "cdtype": _cname(cdtype)})
+    return os.path.join(res, stem + ".npz"), WSR_KEYS + (sweep_key,), files, None
+
+
+def is_cached(cfg: Config, exp: str, device: str = "cpu", cdtype=C128) -> bool:
+    """True if experiment ``exp``'s npz exists and matches the current config and artifacts."""
+    path, keys, files, extra = cache_spec(cfg, exp, device, cdtype)
+    return check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=files), extra)
+
+
+def summarize_power(z, pts) -> dict:
+    """Summary of exp_05 (keys in the module docstring)."""
+    s = _summ_wsr(z, "P", pts, eta_prefix="eta_ratio_of_means_")
+    for n in NETS:
+        rom = [float(z[f"eta_ratio_of_means_{n}_P{P}"]) for P in pts]
+        for P in pts:
+            s[f"eta_mean_of_ratios_{n}_P{P}"] = float(z[f"eta_mean_of_ratios_{n}_P{P}"])
+        s[f"eta_range_{n}"] = (min(rom), max(rom))
+        s[f"eta_min_{n}"], s[f"eta_max_{n}"] = min(rom), max(rom)
+    return s
+
+
+def summarize_gpu(z, Ms, Ks) -> dict:
+    """Summary of the supplementary GPU timing (keys in the module docstring)."""
+    s = {"gpu_available": 1.0}
+    s.update(_summ_runtime(z, "M", Ms))
+    s.update(_summ_runtime(z, "K", Ks))
+    for m in TIME_METHODS:
+        s[f"step_time_ms_{m}"] = float(1e3 * np.nanmean(_step_times(z, m)))
+    for mode in AO_MODES:
+        s[f"ao_conv_time_ms_{mode}"] = float(1e3 * np.nanmean(z[f"ao_cumtime_{mode}"]))
+        s[f"ao_conv_n_failed_{mode}"] = float(np.isnan(z[f"ao_cumtime_{mode}"]).sum())
+    return s
+
+
+def summarize(cfg: Config, exp: str, z) -> dict:
+    """Summary dict of experiment ``exp`` from its npz (exactly what the matching run_* returns)."""
+    z = _load(z)
+    if exp == GPU_EXP:
+        return summarize_gpu(z, tuple(cfg.sweep_M), tuple(cfg.sweep_K))
+    _, _, pts, tag, _ = EXPERIMENTS[exp]
+    pts = pts(cfg)
+    if exp.startswith("runtime_"):
+        return _summ_runtime(z, tag, pts)
+    if exp == "power":
+        return summarize_power(z, pts)
+    if exp == "zeroshot_M":
+        s = _summ_wsr(z, "M", pts, suffix="_zeroshot")
+        s["M_reference"] = float(z["M_reference"])
+        return s
+    return _summ_wsr(z, tag, pts)
+
+
+def _run_runtime(cfg, exp, device, cdtype, force_rerun, plot_fn, fig_name):
     default = torch.device(device).type == "cpu" and cdtype == C128
-    stem = exp if default else f"{exp}_{torch.device(device).type}_{_cname(cdtype)}"
-    path = os.path.join(_results_dir(cfg), stem + ".npz")
-    keys = TIME_KEYS + (sweep_key,)
-    extra = {"device": str(device), "cdtype": _cname(cdtype)}
-    if force_rerun or not check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=_ds(split, points)), extra):
+    _, split, pts_fn, tag, _ = EXPERIMENTS[exp]
+    points = pts_fn(cfg)
+    _results_dir(cfg)
+    path, keys, files, extra = cache_spec(cfg, exp, device, cdtype)
+    if force_rerun or not check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=files), extra):
         models = load_trained_models(cfg)
         out, threads = _with_threads(cfg, lambda: _runtime_arrays(cfg, split, points, tag, device, cdtype, models))
         idx = _timing_idx(cfg)
         out.update(points=np.array(points), timing_idx=idx, timing_n_samples=np.int64(len(idx)),
                    timing_threads=np.int64(threads), device=np.array(str(device)), cdtype=np.array(_cname(cdtype)),
-                   **_meta(cfg, keys, artifact_fingerprint(cfg, extra=_ds(split, points))))
+                   **_meta(cfg, keys, artifact_fingerprint(cfg, extra=files)))
         if tag == "M":
             out["maso_M_train"] = np.array(points)
         _atomic_npz(path, **out)
@@ -277,29 +356,30 @@ def _run_runtime(cfg, exp, split, points, tag, sweep_key, device, cdtype, force_
     z = _load(path)
     if default:
         _fig(plot_fn, z, fig_name, cfg)
-    return Path(path), _summ_runtime(z, tag, points)
+    return Path(path), summarize(cfg, exp, z)
 
 
 def run_runtime_vs_M(cfg: Config, device: str = "cpu", cdtype=C128, force_rerun: bool = False):
     """exp_04: per-iteration/per-layer time vs M (K = cfg.K); untrained MASO(M_train=M)."""
-    return _run_runtime(cfg, "exp_04_runtime_vs_M", "sweep_M", tuple(cfg.sweep_M), "M", "sweep_M", device,
-                        cdtype, force_rerun, plot_fig4, "avg_time_vs_Number_of_RIS_M")
+    return _run_runtime(cfg, "runtime_M", device, cdtype, force_rerun, plot_fig4, "avg_time_vs_Number_of_RIS_M")
 
 
 def run_runtime_vs_K(cfg: Config, device: str = "cpu", cdtype=C128, force_rerun: bool = False):
     """exp_07: per-iteration/per-layer time vs K (M = cfg.M); trained models."""
-    return _run_runtime(cfg, "exp_07_runtime_vs_K", "sweep_K", tuple(cfg.sweep_K), "K", "sweep_K", device,
-                        cdtype, force_rerun, plot_fig7, "avg_time_vs_Number_of_active_users_K")
+    return _run_runtime(cfg, "runtime_K", device, cdtype, force_rerun, plot_fig7,
+                        "avg_time_vs_Number_of_active_users_K")
 
 
 # ---------------------------------------------------------------- WSR experiments (5, 6, 8)
-def _run_wsr(cfg, exp, split, points, tag, sweep_key, force_rerun, post=None):
-    path = os.path.join(_results_dir(cfg), exp + ".npz")
-    keys = WSR_KEYS + (sweep_key,)
-    if force_rerun or not check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=_ds(split, points))):
+def _run_wsr(cfg, exp, force_rerun, post=None):
+    _, split, pts_fn, tag, _ = EXPERIMENTS[exp]
+    points = pts_fn(cfg)
+    _results_dir(cfg)
+    path, keys, files, extra = cache_spec(cfg, exp)
+    if force_rerun or not check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=files), extra):
         out = _wsr_arrays(cfg, split, points, tag, load_trained_models(cfg))
         out.update(points=np.array(points), ao_baseline_max_iter=np.int64(cfg.ao_max_iter),
-                   **_meta(cfg, keys, artifact_fingerprint(cfg, extra=_ds(split, points))))
+                   **_meta(cfg, keys, artifact_fingerprint(cfg, extra=files)))
         if post:
             post(out)
         _atomic_npz(path, **out)
@@ -321,27 +401,19 @@ def _eta_post(points):
 def run_power_sweep(cfg: Config, force_rerun: bool = False):
     """exp_05: efficiency eta vs CRN peak power (PMN = CRN - 10 dB), models trained at 20 dBm."""
     pts = tuple(cfg.sweep_crn_dbm)
-    path = _run_wsr(cfg, "exp_05_power_sweep", "sweep_power", pts, "P", "sweep_crn_dbm", force_rerun,
-                    _eta_post(pts))
+    path = _run_wsr(cfg, "power", force_rerun, _eta_post(pts))
     z = _load(path)
-    s = _summ_wsr(z, "P", pts, eta_prefix="eta_ratio_of_means_")
-    for n in NETS:
-        rom = [float(z[f"eta_ratio_of_means_{n}_P{P}"]) for P in pts]
-        for P in pts:
-            s[f"eta_mean_of_ratios_{n}_P{P}"] = float(z[f"eta_mean_of_ratios_{n}_P{P}"])
-        s[f"eta_range_{n}"] = (min(rom), max(rom))
-        s[f"eta_min_{n}"], s[f"eta_max_{n}"] = min(rom), max(rom)
+    s = summarize(cfg, "power", z)
     _fig(plot_fig5, z, "etha_vs_CRN_transmit_power", cfg)
     return Path(path), s
 
 
 def run_wsr_vs_K(cfg: Config, force_rerun: bool = False):
     """exp_06: mean WSR vs K (M = cfg.M) for AO and the three nets."""
-    pts = tuple(cfg.sweep_K)
-    path = _run_wsr(cfg, "exp_06_wsr_vs_K", "sweep_K", pts, "K", "sweep_K", force_rerun)
+    path = _run_wsr(cfg, "wsr_K", force_rerun)
     z = _load(path)
     _fig(plot_fig6, z, "WSR_vs_Number_of_active_users_K", cfg)
-    return Path(path), _summ_wsr(z, "K", pts)
+    return Path(path), summarize(cfg, "wsr_K", z)
 
 
 def zeroshot_points(cfg: Config) -> tuple:
@@ -357,10 +429,9 @@ def run_zeroshot_M(cfg: Config, force_rerun: bool = False):
         out["M_values"] = np.array(pts)
         out["M_reference"] = np.int64(cfg.M)
 
-    path = _run_wsr(cfg, "exp_08_zeroshot_M", "sweep_M", pts, "M", "zeroshot_M", force_rerun, post)
+    path = _run_wsr(cfg, "zeroshot_M", force_rerun, post)
     z = _load(path)
-    s = _summ_wsr(z, "M", pts, suffix="_zeroshot")
-    s["M_reference"] = float(z["M_reference"])
+    s = summarize(cfg, "zeroshot_M", z)
     _fig(plot_fig8, z, "WSR_vs_M_ZeroShot", cfg)
     return Path(path), s
 
@@ -372,10 +443,9 @@ def run_gpu_timing(cfg: Config, force_rerun: bool = False):
         print("[gpu timing] CUDA not available; skipping the supplementary GPU timing", flush=True)
         return None, {"gpu_available": 0.0}
     device, cdtype = "cuda", C64
-    path = os.path.join(_results_dir(cfg), "exp_supp_gpu_timing.npz")
-    keys = TIME_KEYS + ("sweep_M", "sweep_K", "ao_tol", "ao_max_iter")
+    _results_dir(cfg)
+    path, keys, files, _ = cache_spec(cfg, GPU_EXP)
     Ms, Ks = tuple(cfg.sweep_M), tuple(cfg.sweep_K)
-    files = _ds("sweep_M", Ms) + _ds("sweep_K", Ks) + ["datasets/test.pt"]
     if force_rerun or not check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=files)):
         models = load_trained_models(cfg)
         idx = _timing_idx(cfg)
@@ -427,16 +497,7 @@ def run_gpu_timing(cfg: Config, force_rerun: bool = False):
                          "mean_ms": 1e3 * np.nanmean(t), "median_ms": 1e3 * np.nanmedian(t),
                          "n_failed": int(np.isnan(t).sum())})
         _write_csv(path[:-4] + ".csv", ["experiment", "method", "point", "mean_ms", "median_ms", "n_failed"], rows)
-    z = _load(path)
-    s = {"gpu_available": 1.0}
-    s.update(_summ_runtime(z, "M", Ms))
-    s.update(_summ_runtime(z, "K", Ks))
-    for m in TIME_METHODS:
-        s[f"step_time_ms_{m}"] = float(1e3 * np.nanmean(_step_times(z, m)))
-    for mode in AO_MODES:
-        s[f"ao_conv_time_ms_{mode}"] = float(1e3 * np.nanmean(z[f"ao_cumtime_{mode}"]))
-        s[f"ao_conv_n_failed_{mode}"] = float(np.isnan(z[f"ao_cumtime_{mode}"]).sum())
-    return Path(path), s
+    return Path(path), summarize(cfg, GPU_EXP, _load(path))
 
 
 def _step_times(z, m) -> np.ndarray:
