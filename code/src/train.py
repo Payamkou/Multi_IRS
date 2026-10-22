@@ -451,8 +451,8 @@ def run_lr_pilot(name: str, cfg: Config) -> float:
             rows.append({"lr": lr, "epoch": ep, "stage": st, "val_wsr_mean": v["wsr_mean"]})
             pbar.set_postfix(loss=f"{m['train_loss']:.4g}", val_wsr=f"{v['wsr_mean']:.4f}",
                              skipped=m["n_skipped_batches"])
-            log.info("[pilot %s lr=%g] epoch %d/%d %s train_loss=%.5g val_wsr=%.4f skipped=%d t=%.1fs",
-                     name, lr, ep, n_tot, st, m["train_loss"], v["wsr_mean"], m["n_skipped_batches"],
+            runlog.log_progress(log, "[pilot %s lr=%g] epoch %d/%d %s train_loss=%.5g val_wsr=%.4f skipped=%d t=%.1fs",
+                     ep, n_tot, cfg.log_every, name, lr, ep, n_tot, st, m["train_loss"], v["wsr_mean"], m["n_skipped_batches"],
                      time.time() - t0)
         runner.close()
     choice = _pilot_choice(rows)
@@ -544,8 +544,8 @@ def train_model(name: str, cfg: Config, resume: bool = True, force_retrain: bool
         _write_csv(hist_p, HISTORY_COLS, _history_rows(mh))
         pbar.set_postfix(loss=f"{m['train_loss']:.4g}", val_wsr=f"{v['wsr_mean']:.4f}",
                          best=f"{best_wsr:.4f}@{best_epoch}", skipped=m["n_skipped_batches"])
-        log.info("[%s] epoch %d/%d %s train_loss=%.5g (R_nats=%.5g f_q=%.5g) val_loss=%.5g val_wsr=%.4f%s "
-                 "skipped=%d t=%.1fs", name, ep, n_tot, st, m["train_loss"], m["train_wsr_nats_term"],
+        runlog.log_progress(log, "[%s] epoch %d/%d %s train_loss=%.5g (R_nats=%.5g f_q=%.5g) val_loss=%.5g "
+                 "val_wsr=%.4f%s skipped=%d t=%.1fs", ep, n_tot, cfg.log_every, name, ep, n_tot, st, m["train_loss"], m["train_wsr_nats_term"],
                  m["train_fq_term"], v["loss"], v["wsr_mean"], " *best" if is_best else "",
                  m["n_skipped_batches"], row["epoch_time_sec"])
         if stop_after_epoch is not None and ep >= stop_after_epoch:

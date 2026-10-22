@@ -69,7 +69,8 @@ def _run_split(cfg, split, device, chunk, with_ref):
             put("n_iter_ref1000", rr.n_iter)
         mw = float(acc["wsr_ao"][-1].mean())
         pbar.set_postfix(meanWSR=f"{mw:.4f}")
-        log.info("teacher %s %d/%d meanWSR=%.4f", split, sl.stop, B, mw)
+        runlog.log_progress(log, "teacher %s %d/%d meanWSR=%.4f", lo // chunk + 1, -(-B // chunk), cfg.log_every,
+                            split, sl.stop, B, mw)
     return {k: torch.cat(v) for k, v in acc.items()}
 
 

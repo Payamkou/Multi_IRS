@@ -235,7 +235,8 @@ def _runtime_point(cfg, split, x, tag, device, cdtype, nets: _Nets) -> dict:
     log = runlog.get_logger(cfg, "sweeps")
     if any(nf.values()):
         log.warning("runtime %s=%s: samples failed (LinAlgError, recorded NaN): %s", tag, x, nf)
-    log.info("runtime %s=%s %s/%s ms/iter: %s", tag, x, device, _cname(cdtype), msg)
+    runlog.log_progress(log, "runtime %s=%s %s/%s ms/iter: %s", None, None, cfg.log_every, tag, x, device,
+                        _cname(cdtype), msg)   # per-point: file only, the bar shows progress
     out.update(point=np.int64(x), timing_idx=idx, timing_n_samples=np.int64(len(idx)),
                timing_threads=np.int64(torch.get_num_threads()))
     return out
@@ -255,7 +256,7 @@ def _wsr_arrays(cfg, split, points, tag, models, chunk: int = 250) -> dict:
     out = {}
     dev = cfg.eval_device
     log = runlog.get_logger(cfg, "sweeps")
-    for x in runlog.bar(points, desc=f"WSR sweep {split}", unit="point"):
+    for i_pt, x in enumerate(runlog.bar(points, desc=f"WSR sweep {split}", unit="point"), 1):
         d = data.build_or_load(cfg, split, x)
         ch, theta0 = d["ch"], d["theta0"]
         w, it, w0 = [], [], []
@@ -273,7 +274,7 @@ def _wsr_arrays(cfg, split, points, tag, models, chunk: int = 250) -> dict:
         for n, m in models.items():
             out[f"wsr_{n}_{tag}{x}"] = _wsr_per_layer(m, ch, theta0, dev)[:, -1]
         msg = ", ".join(f"{m} {out[f'wsr_{m}_{tag}{x}'].mean():.4f}" for m in WSR_METHODS)
-        log.info("wsr %s=%s mean WSR: %s", tag, x, msg)
+        runlog.log_progress(log, "wsr %s=%s mean WSR: %s", i_pt, len(points), cfg.log_every, tag, x, msg)
     return out
 
 

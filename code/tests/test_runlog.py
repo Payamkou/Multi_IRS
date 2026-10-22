@@ -56,3 +56,21 @@ def test_bar_is_classic_tqdm():
     b = runlog.bar(range(3), desc="x", disable=True)
     assert type(b) is tqdm
     assert list(b) == [0, 1, 2]
+
+
+def test_log_progress_console_every_n_and_last_file_all(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    try:
+        log = runlog.get_logger(cfg, "train")
+        for ep in range(1, 38):
+            runlog.log_progress(log, "epoch %d/%d", ep, 37, cfg.log_every, ep, 37)
+        log.info("stage message")
+        for h in logging.getLogger("iuf").handlers:
+            h.flush()
+        out = capsys.readouterr().out
+        shown = [int(l.split("epoch ")[1].split("/")[0]) for l in out.splitlines() if "epoch " in l]
+        assert shown == [15, 30, 37] and "stage message" in out
+        text = open(runlog.log_path(cfg), encoding="utf-8").read()
+        assert all(f"epoch {e}/37" in text for e in range(1, 38))
+    finally:
+        runlog.close_logger()

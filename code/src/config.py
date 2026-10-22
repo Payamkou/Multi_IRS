@@ -49,6 +49,7 @@ class Config:
     timing_threads: int = 6
     timing_warmup: int = 3
     timing_subset: Optional[int] = None
+    log_every: int = 15   # console progress summary every N steps (log file gets all); not in any hash key
     train_device: str = "cuda"
     eval_device: str = "cpu"
     root: str = "E:/payam/code/artifacts"

@@ -3,7 +3,8 @@
 ``get_logger(cfg)`` configures the project logger ``iuf`` once per artifact root:
 * a file handler appending to ``{cfg.root}/logs/pipeline.log``
   (format ``%(asctime)s %(levelname)s %(name)s: %(message)s``), so progress survives the session;
-* a stdout handler that writes through ``tqdm.write`` (log lines do not break an active bar).
+* a stdout handler that writes through ``tqdm.write`` (log lines do not break an active bar);
+  per-step records from ``log_progress`` reach it only every ``cfg.log_every`` steps and on the last step.
 Repeated calls add no duplicate handlers; a call with a different ``cfg.root`` closes the old file
 handler and opens the new one (one log file at a time). Module loggers are children (``iuf.train``,
 ``iuf.sweeps`` ...) and share these handlers; ``iuf`` does not propagate to the root logger.
@@ -28,11 +29,22 @@ FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 class _TqdmStdoutHandler(logging.Handler):
     """Writes to the *current* sys.stdout (Jupyter swaps it per cell) via tqdm.write."""
 
+    def filter(self, record):
+        # per-step progress records (log_progress) reach the console only when flagged for it
+        return getattr(record, "console", True) if getattr(record, "progress", False) else True
+
     def emit(self, record):
         try:
             tqdm.write(self.format(record), file=sys.stdout)
         except Exception:  # pragma: no cover - logging must never raise
             self.handleError(record)
+
+
+def log_progress(logger, msg, step, total, every: int = 15, *args, level=logging.INFO) -> None:
+    """Per-step progress line: always written to the log file; shown on the console only when
+    ``step % every == 0`` or ``step == total`` (``step=None``: file only). ``msg`` is %-formatted with ``args``."""
+    show = step is not None and (step == total or (every > 0 and step % every == 0))
+    logger.log(level, msg, *args, extra={"progress": True, "console": bool(show)})
 
 
 def log_path(cfg) -> str:
