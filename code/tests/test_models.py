@@ -230,11 +230,29 @@ def test_build_model_fonr():
 from models.maso import MASO, ComplexLinear, complex_relu  # noqa: E402
 
 
+class _Unwrap:
+    def __init__(self, net):
+        self.net = net
+
+    def remove(self):
+        self.net.__dict__.pop("psi_batched", None)
+
+
 def _capture_mlp_inputs(net):
-    seen = []
-    hooks = [m.register_forward_pre_hook(lambda mod, args: seen.append(args[0].detach().clone()))
-             for m in net.psi]
-    return seen, hooks
+    """Record the per-IRS MLP inputs z[:, n] (one entry per (layer, IRS), as the per-module hooks did) and
+    check that the batched evaluation equals calling each psi module on its own."""
+    seen, real = [], net.psi_batched
+
+    def wrapped(l, z):
+        out = real(l, z)
+        for n in range(net.N):
+            seen.append(z[:, n].detach().clone())
+            with torch.no_grad():
+                ref = net.psi[l * net.N + n](z[:, n])
+            assert torch.allclose(out[:, n], ref, rtol=1e-5, atol=1e-6)
+        return out
+    net.psi_batched = wrapped
+    return seen, [_Unwrap(net)]
 
 
 def test_maso_structure_and_param_count():
@@ -348,10 +366,10 @@ def test_maso_step_scale_buffer_and_scaling():
     ch, p0, phi0 = _make(2, 20, 6)
     p_new, aux = fp.deterministic_block(ch, p0, phi0)
     g = fp.grad_matrix_free(ch, p_new, phi0, aux)
-    out = []
-    hooks = [m.register_forward_hook(lambda mod, a, o: out.append(o.detach())) for m in net.psi]
+    seen, hooks = _capture_mlp_inputs(net)
     with torch.no_grad():
         lam = net.step_sizes(0, phi0, g)
+        out = [net.psi[n](z) for n, z in enumerate(seen)]   # per-module reference
     for h in hooks:
         h.remove()
     raw = torch.stack(out, dim=1)[..., :20]  # Softplus(Re Psi(z))

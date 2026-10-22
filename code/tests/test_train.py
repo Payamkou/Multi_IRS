@@ -429,3 +429,78 @@ def test_loss_version_invalidates_old_runs():
     assert Config().loss_version == 2 and "loss_version" in train.TRAIN_KEYS
     a, b = Config(), dataclasses.replace(Config(), loss_version=1)
     assert config_hash(a, train.PILOT_KEYS) != config_hash(b, train.PILOT_KEYS)
+
+
+# ================================================================ speed path (Task 16 C)
+def test_grads_finite_flag():
+    net = torch.nn.Linear(3, 2)
+    loss = net(torch.ones(1, 3)).sum()
+    loss.backward()
+    assert bool(train._grads_finite(list(net.parameters()), loss))
+    net.weight.grad[0, 1] = float("inf")
+    assert not bool(train._grads_finite(list(net.parameters()), loss))
+    net.weight.grad[0, 1] = float("nan")
+    assert not bool(train._grads_finite(list(net.parameters()), loss))
+    net.weight.grad[0, 1] = 3e38                       # huge but finite: still finite (no norm overflow)
+    net.bias.grad[:] = 3e38
+    assert bool(train._grads_finite(list(net.parameters()), loss))
+    assert not bool(train._grads_finite(list(net.parameters()), loss * float("nan")))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("name", ["fonr", "maso", "tias"])
+def test_cuda_graph_step_matches_eager(name, fresh_root):
+    import copy
+    """The captured training step computes the same loss stats and gradients as the eager step."""
+    cfg = _tiny_cfg(fresh_root("cg" + name), train_device="cuda")
+    D = train._Data(cfg, "cuda")
+    idx = torch.arange(5, 5 + cfg.batch_size, device="cuda")
+    for sup in (True, False):
+        model = train._fresh_model(name, cfg, "cuda")
+        # eager reference on a copy: a parameter first used by a default-stream backward cannot be captured
+        ref = copy.deepcopy(model)
+        loss, st_e = train._batch_loss(ref, D.ch.slice(idx), D.p0[idx], D.phi0[idx], D.phi_star[idx],
+                                       sup, cfg.loss_a)
+        loss.backward()
+        g_e = {k: p.grad.clone() for k, p in ref.named_parameters() if p.grad is not None}
+        g = train._GraphStep(model, D, sup, cfg.loss_a, cfg.batch_size)
+        ok, st_g = g.run(idx)
+        assert bool(ok)
+        torch.testing.assert_close(st_g, st_e, rtol=1e-5, atol=1e-6, equal_nan=True)
+        for k, p in model.named_parameters():
+            if k in g_e:
+                torch.testing.assert_close(p.grad, g_e[k], rtol=1e-4, atol=1e-6)
+        idx2 = torch.arange(20, 20 + cfg.batch_size, device="cuda") % D.B   # replay on another batch
+        ok, st2 = g.run(idx2)
+        assert bool(ok) and not torch.equal(st2[1], st_g[1])
+        del g
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cuda_resume_is_exact(fresh_root):
+    cfg_a = _tiny_cfg(fresh_root("cra"), train_device="cuda")
+    cfg_b = _tiny_cfg(fresh_root("crb"), train_device="cuda")
+    train.train_model("tias", cfg_a)
+    train.train_model("tias", cfg_b, stop_after_epoch=3)
+    train.train_model("tias", cfg_b)
+    la = torch.load(os.path.join(cfg_a.root, "checkpoints", "tias_last.pt"), weights_only=False)
+    lb = torch.load(os.path.join(cfg_b.root, "checkpoints", "tias_last.pt"), weights_only=False)
+    for k, v in la["model_state"].items():
+        assert torch.equal(v, lb["model_state"][k]), k
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cuda_eager_then_graph_capture(fresh_root, monkeypatch):
+    """Eager CUDA steps (side stream) followed by a graph capture on the same parameters work."""
+    cfg = _tiny_cfg(fresh_root("ceg"), train_device="cuda")
+    D = train._Data(cfg, "cuda")
+    model = train._fresh_model("tias", cfg, "cuda")
+    opt = torch.optim.Adam(model.parameters(), lr=0.01)
+    monkeypatch.setattr(train, "USE_CUDA_GRAPHS", False)
+    m = train._train_epoch(model, opt, D, cfg, 3, cfg.n_sup_epochs)
+    assert math.isfinite(m["train_loss"]) and math.isfinite(m["train_fq_term"])
+    monkeypatch.setattr(train, "USE_CUDA_GRAPHS", True)
+    r = train._StepRunner(model, opt, D, cfg)
+    m2 = train._train_epoch(model, opt, D, cfg, 4, cfg.n_sup_epochs, r)
+    assert r.use_graph and r.graphs and math.isfinite(m2["train_loss"])
+    r.close()

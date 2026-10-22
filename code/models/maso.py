@@ -14,7 +14,8 @@ Elements beyond M_train are copied unchanged (exact), i.e. lambda = 0 there.
 
 Psi_{l,n}: ComplexLinear(2Mt->2Mt) -> CReLU -> ComplexLinear(2Mt->2Mt) -> CReLU
            -> ComplexLinear(2Mt->Mt) -> real part -> Softplus.
-Separate weights per (l, n): psi[l * N + n].
+Separate weights per (l, n): psi[l * N + n]. In forward the N weight sets of a layer are evaluated in one
+batched real matmul per ComplexLinear (``psi_batched``; same maths, no Python loop over N).
 
 Parameters are float32 (real/imag parts kept separately); in forward they are cast
 to the input's real dtype so complex128 evaluation works. Complex products use real
@@ -117,12 +118,35 @@ class MASO(UnfoldedNet):
         self.register_buffer("step_scale", torch.tensor(float(step_scale)))
         self.psi = nn.ModuleList([_mlp(self.M_train) for _ in range(self.L * self.N)])
 
+    def psi_batched(self, l: int, z: torch.Tensor) -> torch.Tensor:
+        """Softplus(Re Psi_{l,n}(z[:, n])) for all N IRSs at once -> (B,N,Mt) real.
+
+        Identical maths to calling ``self.psi[l*N+n]`` per IRS, without the Python loop over N: the N
+        weight sets are stacked and every ComplexLinear becomes ONE real batched matmul on the [Re; Im]
+        representation, y = [[W_re, -W_im], [W_im, W_re]] [x_re; x_im] + [b_re; b_im] (ComplexReLU is ReLU
+        on both halves). Real operands only (the CPU batched complex-matmul bug does not apply)."""
+        seqs = [self.psi[l * self.N + n] for n in range(self.N)]
+        rd = z.real.dtype
+        x = torch.cat([z.real, z.imag], dim=-1).transpose(0, 1)          # (N,B,2*in)
+        lins = [i for i, m in enumerate(seqs[0]) if isinstance(m, ComplexLinear)]
+        for j, i in enumerate(lins):
+            Wr = torch.stack([s[i].W_re for s in seqs]).to(rd)             # (N,out,in)
+            Wi = torch.stack([s[i].W_im for s in seqs]).to(rd)
+            b = torch.cat([torch.stack([s[i].b_re for s in seqs]), torch.stack([s[i].b_im for s in seqs])],
+                          dim=-1).to(rd).unsqueeze(1)                       # (N,1,2out)
+            Wt = torch.cat([torch.cat([Wr, -Wi], dim=2), torch.cat([Wi, Wr], dim=2)], dim=1)  # (N,2out,2in)
+            x = torch.baddbmm(b, x, Wt.transpose(1, 2))                      # (N,B,2out)
+            if j < len(lins) - 1:
+                x = F.relu(x)                                                # ComplexReLU
+        out = x[..., : x.shape[-1] // 2]                                     # RealPart
+        return F.softplus(out).transpose(0, 1)                               # (B,N,Mt)
+
     def step_sizes(self, l: int, phi: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """lambda (B,N,M) >= 0 for layer l; zeros beyond M_train."""
         M, Mt = phi.shape[-1], self.M_train
         ghat = g / (torch.linalg.vector_norm(g, dim=-1, keepdim=True) + 1e-12)
         z = torch.cat([_fit(phi, Mt), _fit(ghat, Mt)], dim=-1)  # (B,N,2Mt)
-        lam = torch.stack([self.psi[l * self.N + n](z[:, n]) for n in range(self.N)], dim=1)
+        lam = self.psi_batched(l, z)
         lam = self.step_scale.to(lam.dtype) * lam
         if M <= Mt:
             return lam[..., :M]

@@ -13,6 +13,7 @@ Conventions
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -108,7 +109,7 @@ def wsr(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor, base: str = "2",
     if base == "e":
         return r
     if base == "2":
-        return r / torch.log(torch.tensor(2.0, dtype=r.dtype, device=r.device))
+        return r / math.log(2.0)   # python scalar: no host->device copy (CUDA-graph safe)
     raise ValueError(f"base must be '2' or 'e', got {base!r}")
 
 

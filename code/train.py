@@ -16,6 +16,7 @@ Loss section
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import csv
 import json
@@ -224,6 +225,29 @@ def _fresh_model(name: str, cfg: Config, device):
     return build_model(name, cfg).to(device)
 
 
+def _grads_finite(params, loss: torch.Tensor) -> torch.Tensor:
+    """0-dim bool tensor: loss and every existing parameter gradient are finite. No host sync: x*0 is 0
+    for finite x and NaN for inf/NaN, so the summed norms of the zeroed grads are finite iff all are."""
+    grads = [p.grad for p in params if p.grad is not None]
+    tot = loss.detach().float() * 0
+    if grads:
+        tot = tot + torch.stack([n.float() for n in torch._foreach_norm(torch._foreach_mul(grads, 0.0))]).sum()
+    return torch.isfinite(tot)
+
+
+def _apply_step(model, opt, ok: torch.Tensor, max_norm: float, clear: bool = True) -> bool:
+    """Guarded optimizer step given the finiteness flag (the one host sync per batch). Returns True if
+    the batch was skipped (Adam state untouched; grads cleared unless ``clear=False``, used by the CUDA
+    graph path whose static grads are overwritten by the next replay)."""
+    if not bool(ok):
+        if clear:
+            opt.zero_grad(set_to_none=True)
+        return True
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+    opt.step()
+    return False
+
+
 def _optimizer_step(model, opt, loss: torch.Tensor, max_norm: float) -> bool:
     """Backward + guarded step, identical for every model. Returns True if the batch was skipped.
 
@@ -231,50 +255,144 @@ def _optimizer_step(model, opt, loss: torch.Tensor, max_norm: float) -> bool:
     (Adam state untouched). Otherwise clip the global grad norm to ``max_norm`` and step."""
     opt.zero_grad(set_to_none=True)
     loss.backward()
-    params = [p for p in model.parameters() if p.grad is not None]
-    ok = bool(torch.isfinite(loss.detach())) and all(bool(torch.isfinite(p.grad).all()) for p in params)
-    if not ok:
-        opt.zero_grad(set_to_none=True)
-        return True
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
-    opt.step()
-    return False
+    return _apply_step(model, opt, _grads_finite(list(model.parameters()), loss), max_norm)
 
 
-def _train_epoch(model, opt, D: _Data, cfg: Config, epoch: int, n_sup: int) -> dict:
+def _batch_loss(model, c: ChannelBatch, p0, phi0, phi_star, sup: bool, a: float):
+    """Forward + training loss of one batch -> (loss, stats). ``stats`` (5,) is detached:
+    [loss, mean WSR (bits), std WSR, R_nats term, f_q term] (the two terms NaN in Stage I)."""
+    tr = model(c, p0, phi0)
+    if sup:
+        loss = loss_supervised(tr.phi[-1], phi_star)
+        rt = fq = loss.detach().new_full((), float("nan"))
+    else:
+        loss, rt, fq = loss_deep_supervision(c, tr, a, terms=True)
+    with torch.no_grad():
+        w = fp.wsr(c, tr.p[-1].detach(), tr.phi[-1].detach())
+        sd = w.std() if w.numel() > 1 else w.new_zeros(())
+        stats = torch.stack([loss.detach().to(w.dtype), w.mean(), sd, rt.to(w.dtype), fq.to(w.dtype)])
+    return loss, stats
+
+
+USE_CUDA_GRAPHS = True   # capture the training step as a CUDA graph on GPU (same math, ~no launch overhead)
+
+
+class _GraphStep:
+    """One stage's training step (gather batch -> forward -> loss -> backward -> finiteness flag and
+    stats) captured as a CUDA graph at the fixed batch size. ``run(idx)`` copies the batch indices into
+    the static index buffer and replays; parameter grads are static tensors read by the (eager)
+    clip + Adam step. The math is exactly the eager step's; the graph only removes the per-kernel
+    launch cost (thousands of small kernels per step, which dominated the GPU epoch time)."""
+
+    def __init__(self, model, D: "_Data", sup: bool, a: float, B: int):
+        self.model = model
+        self.params = list(model.parameters())
+        self.idx = torch.arange(B, device=D.device)
+
+        def body():
+            c = D.ch.slice(self.idx)
+            ps = D.phi_star[self.idx] if sup else None
+            return _batch_loss(model, c, D.p0[self.idx], D.phi0[self.idx], ps, sup, a)
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):          # warm-up (required before capture); no optimizer step
+            for _ in range(2):
+                model.zero_grad(set_to_none=True)
+                loss, _ = body()
+                loss.backward()
+        torch.cuda.current_stream().wait_stream(side)
+        model.zero_grad(set_to_none=True)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            loss, self.stats = body()
+            loss.backward()
+            self.ok = _grads_finite(self.params, loss)
+
+    def run(self, idx: torch.Tensor):
+        self.idx.copy_(idx)
+        self.graph.replay()
+        return self.ok, self.stats.clone()
+
+
+class _StepRunner:
+    """Eager or CUDA-graph training steps for one model/optimizer (graphs built lazily per stage)."""
+
+    def __init__(self, model, opt, D: "_Data", cfg: Config):
+        self.model, self.opt, self.D, self.cfg = model, opt, D, cfg
+        self.use_graph = USE_CUDA_GRAPHS and torch.device(D.device).type == "cuda"
+        self.graphs = {}
+
+    def _graph(self, sup: bool):
+        if sup not in self.graphs:
+            self.graphs.clear()                # one live graph at a time (frees the other stage's pool)
+            try:
+                self.graphs[sup] = _GraphStep(self.model, self.D, sup, self.cfg.loss_a, self.cfg.batch_size)
+            except Exception as e:             # pragma: no cover - fall back to eager, loudly
+                runlog.get_logger(self.cfg, "train").warning("CUDA graph capture failed (%s); eager steps", e)
+                self.use_graph = False
+                self.model.zero_grad(set_to_none=True)
+                return None
+        return self.graphs[sup]
+
+    def step(self, idx: torch.Tensor, sup: bool):
+        """-> (skipped: bool, stats (5,) tensor on device)."""
+        D, cfg = self.D, self.cfg
+        if self.use_graph and idx.numel() == cfg.batch_size:
+            g = self._graph(sup)
+            if g is not None:
+                ok, stats = g.run(idx)
+                return _apply_step(self.model, self.opt, ok, cfg.grad_clip_norm, clear=False), stats
+        self.opt.zero_grad(set_to_none=not self.graphs)   # keep a live graph's static grad tensors
+        # On CUDA the eager step runs on a side stream: a parameter whose first backward ran on the legacy
+        # default stream can no longer be captured into a CUDA graph.
+        ctx = torch.cuda.stream(self._side()) if torch.device(D.device).type == "cuda" else contextlib.nullcontext()
+        with ctx:
+            c = D.ch.slice(idx)
+            loss, stats = _batch_loss(self.model, c, D.p0[idx], D.phi0[idx], D.phi_star[idx] if sup else None,
+                                      sup, cfg.loss_a)
+            loss.backward()
+            ok = _grads_finite(list(self.model.parameters()), loss)
+        if torch.device(D.device).type == "cuda":
+            torch.cuda.current_stream().wait_stream(self._stream)
+        return _apply_step(self.model, self.opt, ok, cfg.grad_clip_norm, clear=not self.graphs), stats
+
+    def _side(self):
+        if getattr(self, "_stream", None) is None:
+            self._stream = torch.cuda.Stream()
+        self._stream.wait_stream(torch.cuda.current_stream())
+        return self._stream
+
+    def close(self):
+        self.graphs.clear()
+        self.model.zero_grad(set_to_none=True)
+
+
+def _train_epoch(model, opt, D: _Data, cfg: Config, epoch: int, n_sup: int, runner: _StepRunner = None) -> dict:
     """One epoch; epochs 1..n_sup supervised, later deep-supervised Stage II.
     train_* are means over the epoch's NON-skipped batches (train_wsr_std = mean of per-batch
     stds); NaN if every batch was skipped. n_skipped_batches counts batches whose step was
-    skipped for non-finite loss/gradients."""
+    skipped for non-finite loss/gradients. Per-batch statistics stay on the device and are copied
+    to the host once per epoch; the only per-batch host sync is the finiteness flag."""
     model.train()
+    runner = runner or _StepRunner(model, opt, D, cfg)
     gen = torch.Generator().manual_seed(seed_for("train") + epoch)
-    perm = torch.randperm(D.B, generator=gen)
-    losses, means, stds, rts, fqs, n_skip = [], [], [], [], [], 0
+    perm = torch.randperm(D.B, generator=gen).to(D.device)
+    sup = epoch <= n_sup
+    kept, n_skip = [], 0
     for lo in range(0, D.B, cfg.batch_size):
-        idx = perm[lo:lo + cfg.batch_size].to(D.device)
-        c = D.ch.slice(idx)
-        tr = model(c, D.p0[idx], D.phi0[idx])
-        if epoch <= n_sup:
-            loss = loss_supervised(tr.phi[-1], D.phi_star[idx])
-            rt = fq = None
-        else:
-            loss, rt, fq = loss_deep_supervision(c, tr, cfg.loss_a, terms=True)
-        skipped = _optimizer_step(model, opt, loss, cfg.grad_clip_norm)
+        skipped, stats = runner.step(perm[lo:lo + cfg.batch_size], sup)
         n_skip += skipped
-        if skipped:
-            continue
-        with torch.no_grad():
-            w = fp.wsr(c, tr.p[-1].detach(), tr.phi[-1].detach())
-        losses.append(loss.item())
-        means.append(float(w.mean()))
-        stds.append(float(w.std()) if w.numel() > 1 else 0.0)
-        rts.append(float("nan") if rt is None else float(rt))
-        fqs.append(float("nan") if fq is None else float(fq))
-    nb = len(losses)
-    avg = (lambda v: sum(v) / nb) if nb else (lambda v: float("nan"))
-    return {"train_loss": avg(losses), "train_wsr_mean": avg(means),
-            "train_wsr_std": avg(stds), "n_skipped_batches": int(n_skip),
-            "train_wsr_nats_term": avg(rts), "train_fq_term": avg(fqs)}
+        if not skipped:
+            kept.append(stats)
+    nb = len(kept)
+    if nb:
+        cols = torch.stack(kept).double().cpu().T.tolist()      # 5 lists of python floats
+        avg = [sum(v) / nb for v in cols]
+    else:
+        avg = [float("nan")] * 5
+    return {"train_loss": avg[0], "train_wsr_mean": avg[1], "train_wsr_std": avg[2],
+            "n_skipped_batches": int(n_skip), "train_wsr_nats_term": avg[3], "train_fq_term": avg[4]}
 
 
 def _val(model, D: _Data, cfg: Config) -> dict:
@@ -323,10 +441,11 @@ def run_lr_pilot(name: str, cfg: Config) -> float:
     for lr in cfg.lr_grid:
         model = _fresh_model(name, cfg, device)
         opt = torch.optim.Adam(model.parameters(), lr=lr)
+        runner = _StepRunner(model, opt, D, cfg)
         pbar = runlog.bar(range(1, n_tot + 1), desc=f"pilot {name} lr={lr:g}", unit="epoch")
         for ep in pbar:
             t0 = time.time()
-            m = _train_epoch(model, opt, D, cfg, ep, n_sup)
+            m = _train_epoch(model, opt, D, cfg, ep, n_sup, runner)
             v = _val(model, D, cfg)
             st = _stage(ep, n_sup)
             rows.append({"lr": lr, "epoch": ep, "stage": st, "val_wsr_mean": v["wsr_mean"]})
@@ -335,6 +454,7 @@ def run_lr_pilot(name: str, cfg: Config) -> float:
             log.info("[pilot %s lr=%g] epoch %d/%d %s train_loss=%.5g val_wsr=%.4f skipped=%d t=%.1fs",
                      name, lr, ep, n_tot, st, m["train_loss"], v["wsr_mean"], m["n_skipped_batches"],
                      time.time() - t0)
+        runner.close()
     choice = _pilot_choice(rows)
     log.info("[pilot %s] selected lr %g", name, choice)
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -396,10 +516,11 @@ def train_model(name: str, cfg: Config, resume: bool = True, force_retrain: bool
         log.info("[%s] training from scratch: lr %g, %d+%d epochs, device %s", name, lr, n_sup, n_tot - n_sup, device)
     pbar = runlog.bar(range(start, n_tot + 1), desc=f"train {name}", unit="epoch", initial=start - 1,
                       total=n_tot)
+    runner = _StepRunner(model, opt, D, cfg)
     for ep in pbar:
         t0 = time.time()
         st = _stage(ep, n_sup)
-        m = _train_epoch(model, opt, D, cfg, ep, n_sup)
+        m = _train_epoch(model, opt, D, cfg, ep, n_sup, runner)
         v = _val(model, D, cfg)
         is_best = math.isfinite(v["wsr_mean"]) and v["wsr_mean"] > best_wsr
         if is_best:
@@ -430,6 +551,7 @@ def train_model(name: str, cfg: Config, resume: bool = True, force_retrain: bool
         if stop_after_epoch is not None and ep >= stop_after_epoch:
             break
     pbar.close()
+    runner.close()
     if not os.path.exists(best_p):
         msg = f"{name}: no finite validation WSR so far; {best_p} (best.pt) not written"
         if mh["epoch"] and mh["epoch"][-1] >= n_tot:
