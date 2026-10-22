@@ -33,7 +33,7 @@ def _model(name):
     return build_model(name, cfg)
 
 
-MODELS = ["fonr"]  # MASO and TIAS are appended in Tasks 6-7
+MODELS = ["fonr", "maso"]  # TIAS is appended in Task 7
 
 
 def test_fonr_param_count():
@@ -63,7 +63,7 @@ def test_feasibility_all_layers(name, cdtype):
 @pytest.mark.parametrize("name", MODELS)
 def test_size_handling(name):
     net = _model(name)
-    for M, K in [(20, 6), (180, 6), (80, 60)]:
+    for M, K in [(20, 6), (160, 6), (180, 6), (80, 60)]:
         ch, p0, phi0 = _make(2, M, K)
         with torch.no_grad():
             tr = net(ch, p0, phi0)
@@ -158,3 +158,113 @@ def test_build_model_fonr():
     assert net.L == 10 and net.T == 3
     with pytest.raises(ValueError):
         build_model("nope", Config())
+
+
+# ---------------------------------------------------------------- MASO (spec 6.3)
+from models.maso import MASO, ComplexLinear, complex_relu  # noqa: E402
+
+
+def _capture_mlp_inputs(net):
+    seen = []
+    hooks = [m.register_forward_pre_hook(lambda mod, args: seen.append(args[0].detach().clone()))
+             for m in net.psi]
+    return seen, hooks
+
+
+def test_maso_structure_and_param_count():
+    net = build_model("maso", Config())
+    assert isinstance(net, MASO) and net.L == 10 and net.N == 2 and net.M_train == 80
+    assert len(net.psi) == 20
+    n = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    per = 2 * (2 * 160 * 160 + 2 * 160) + (2 * 160 * 80 + 2 * 80)
+    assert n == 20 * per
+    assert all(not p.is_complex() and p.dtype == torch.float32 for p in net.parameters())
+
+
+def test_complex_relu_and_linear():
+    z = torch.tensor([1 - 2j, -3 + 4j, -1 - 1j], dtype=C128)
+    assert torch.equal(complex_relu(z), torch.tensor([1 + 0j, 0 + 4j, 0j], dtype=C128))
+    torch.manual_seed(0)
+    lin = ComplexLinear(5, 3)
+    x = torch.randn(7, 5, dtype=C128)
+    W = torch.complex(lin.W_re.double(), lin.W_im.double())
+    b = torch.complex(lin.b_re.double(), lin.b_im.double())
+    ref = torch.stack([W @ x[i] + b for i in range(7)])  # per-row, no batched complex matmul
+    out = lin(x)
+    assert out.dtype == C128 and torch.allclose(out, ref, atol=1e-12)
+
+
+def test_maso_padding_small_M():
+    torch.manual_seed(0)
+    net = MASO(L=1, N=2, M_train=80)
+    ch, p0, phi0 = _make(3, 20, 6)
+    p_new, aux = fp.deterministic_block(ch, p0, phi0)
+    g = fp.grad_matrix_free(ch, p_new, phi0, aux)
+    seen, hooks = _capture_mlp_inputs(net)
+    with torch.no_grad():
+        lam = net.step_sizes(0, phi0, g)
+    for h in hooks:
+        h.remove()
+    assert lam.shape == (3, 2, 20) and torch.all(lam >= 0)
+    assert len(seen) == 2
+    ghat = g / (torch.linalg.vector_norm(g, dim=-1, keepdim=True) + 1e-12)
+    for n, z in enumerate(seen):
+        assert z.shape == (3, 160)
+        assert torch.equal(z[:, :20], phi0[:, n]) and torch.equal(z[:, 80:100], ghat[:, n])
+        assert torch.all(z[:, 20:80] == 0) and torch.all(z[:, 100:] == 0)
+
+
+def test_maso_truncation_large_M():
+    torch.manual_seed(0)
+    net = MASO(L=3, N=2, M_train=80)
+    ch, p0, phi0 = _make(2, 160, 6)
+    seen, hooks = _capture_mlp_inputs(net)
+    with torch.no_grad():
+        tr = net(ch, p0, phi0)
+    for h in hooks:
+        h.remove()
+    assert all(z.shape == (2, 160) for z in seen)
+    for l in range(1, 4):
+        assert torch.equal(tr.phi[l][..., 80:], phi0[..., 80:])
+    assert not torch.allclose(tr.phi[-1][..., :80], phi0[..., :80])
+    # gradient direction normalised over the FULL M before truncation
+    p_new, aux = fp.deterministic_block(ch, p0, phi0)
+    g = fp.grad_matrix_free(ch, p_new, phi0, aux)
+    ghat = g / (torch.linalg.vector_norm(g, dim=-1, keepdim=True) + 1e-12)
+    assert torch.equal(seen[0][:, :80], phi0[:, 0, :80])
+    assert torch.equal(seen[0][:, 80:], ghat[:, 0, :80])
+
+
+def test_maso_K_agnostic_input():
+    net = MASO(L=1, N=2, M_train=80)
+    for K in (6, 60):
+        ch, p0, phi0 = _make(2, 80, K)
+        seen, hooks = _capture_mlp_inputs(net)
+        with torch.no_grad():
+            net(ch, p0, phi0)
+        for h in hooks:
+            h.remove()
+        assert all(z.shape == (2, 2 * 80) for z in seen)
+    assert net.psi[0][0].W_re.shape == (160, 160)
+
+
+def test_maso_update_formula():
+    torch.manual_seed(1)
+    net = MASO(L=1, N=2, M_train=80)
+    ch, p0, phi0 = _make(2, 80, 6)
+    p_new, aux = fp.deterministic_block(ch, p0, phi0)
+    with torch.no_grad():
+        out = net.phase_update(0, ch, p_new, phi0, aux)
+        g = fp.grad_matrix_free(ch, p_new, phi0, aux)
+        lam = net.step_sizes(0, phi0, g)
+    r = g - (g * phi0.conj()).real * phi0
+    u = phi0 + lam * r
+    assert torch.allclose(out, u / u.abs(), atol=1e-12)
+
+
+def test_maso_grad_flows_complex64():
+    net = MASO(L=2, N=2, M_train=80)
+    ch, p0, phi0 = _make(2, 80, 6, cdtype=torch.complex64)
+    tr = net(ch, p0, phi0)
+    fp.wsr(ch, tr.p[-1], tr.phi[-1]).mean().backward()
+    assert net.psi[0][0].W_re.grad is not None and torch.isfinite(net.psi[0][0].W_re.grad).all()

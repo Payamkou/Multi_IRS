@@ -12,6 +12,9 @@ def build_model(name: str, cfg, **kw) -> UnfoldedNet:
         if mu_init is None:
             mu_init = fonr_mu_init(cfg)
         return FONR(L=kw.pop("L", cfg.L), T=kw.pop("T", cfg.T), mu_init=mu_init)
-    if name in ("maso", "tias"):
+    if name == "maso":
+        from .maso import MASO
+        return MASO(L=kw.pop("L", cfg.L), N=kw.pop("N", cfg.N), M_train=kw.pop("M_train", cfg.maso_M_train))
+    if name == "tias":
         raise NotImplementedError(f"{name} is implemented in a later task")
     raise ValueError(f"unknown model {name!r}")
