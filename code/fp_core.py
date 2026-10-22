@@ -7,6 +7,9 @@ Conventions
 * Gradients are Wirtinger gradients w.r.t. phi* (torch's ``phi.grad`` of a real
   loss equals twice this).
 * No Python loops over K, M or N: everything is einsum / broadcasting.
+* The K- and M-reductions below use broadcast-multiply-sum, NOT einsum/matmul:
+  torch 2.8 CPU batched complex128 matmul with a 1-row left operand returns wrong,
+  nondeterministic values when multithreaded (see test_fp_core regression test).
 """
 from __future__ import annotations
 
@@ -28,6 +31,12 @@ def _x(ch: ChannelBatch, like: torch.Tensor) -> torch.Tensor:
     return ch.x.to(dtype=like.dtype)
 
 
+def _sum_users(ch: ChannelBatch, coef: torch.Tensor) -> torch.Tensor:
+    """sum_k x_{n,k} coef_k b_{n,k}  -> (B,N,M), via broadcast (no batched matmul)."""
+    wgt = _x(ch, ch.b) * coef.unsqueeze(1)                   # (B,N,K)
+    return (wgt.unsqueeze(-1) * ch.b).sum(2)
+
+
 @dataclass
 class Aux:
     alpha: torch.Tensor  # (B,K) Lagrangian dual auxiliary, = SINR
@@ -41,7 +50,8 @@ class Aux:
 # ---------------------------------------------------------------- system model
 def effective_channel(ch: ChannelBatch, phi: torch.Tensor) -> torch.Tensor:
     """H_k = hd_k + sum_n x_{n,k} b_{n,k}^H phi_n  -> (B,K)."""
-    return ch.hd + torch.einsum("bnk,bnkm,bnm->bk", _x(ch, ch.b), ch.b.conj(), phi)
+    casc = (ch.b.conj() * phi.unsqueeze(2)).sum(-1)          # (B,N,K) b_{n,k}^H phi_n
+    return ch.hd + (_x(ch, ch.b) * casc).sum(1)
 
 
 def received_power(ch: ChannelBatch, p: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
@@ -117,13 +127,13 @@ def obs_scalar(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor, aux: Aux) -
 def grad_matrix_free(ch: ChannelBatch, p: torch.Tensor, phi: torch.Tensor, aux: Aux) -> torch.Tensor:
     """g_n = sum_k x_{n,k} c_k b_{n,k} = grad_{phi_n*} f3  -> (B,N,M)."""
     c = obs_scalar(ch, p, phi, aux)
-    return torch.einsum("bnk,bk,bnkm->bnm", _x(ch, ch.b), c, ch.b)
+    return _sum_users(ch, c)
 
 
 def excitation_v(ch: ChannelBatch, p: torch.Tensor, aux: Aux) -> torch.Tensor:
     """v_n = sum_k x_{n,k} (sqrt(wt p) eps - Xi p hd) b_{n,k}  (hd NOT conjugated)."""
     coef = torch.sqrt(aux.wt * p) * aux.eps - aux.Xi.unsqueeze(-1) * p * ch.hd
-    return torch.einsum("bnk,bk,bnkm->bnm", _x(ch, ch.b), coef, ch.b)
+    return _sum_users(ch, coef)
 
 
 def curvature_A(ch: ChannelBatch, p: torch.Tensor, aux: Aux) -> torch.Tensor:
@@ -135,4 +145,4 @@ def curvature_A(ch: ChannelBatch, p: torch.Tensor, aux: Aux) -> torch.Tensor:
 def diag_A(ch: ChannelBatch, p: torch.Tensor, aux: Aux) -> torch.Tensor:
     """[A_n]_mm = Xi sum_k x_{n,k} p_k |b_{n,k,m}|^2  -> (B,N,M) real."""
     wgt = ch.x.to(p.dtype) * (aux.Xi.unsqueeze(-1) * p).unsqueeze(1)  # (B,N,K)
-    return torch.einsum("bnk,bnkm->bnm", wgt, ch.b.abs() ** 2)
+    return (wgt.unsqueeze(-1) * ch.b.abs() ** 2).sum(2)

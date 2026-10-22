@@ -147,3 +147,30 @@ def test_quadratic_transform_optimal_eps(setup):
     # at the optimum, f3 equals the alpha-fixed objective sum_k wt_k p_k|H_k|^2/D
     target = (aux.wt * p * aux.H.abs() ** 2).sum(-1) / aux.D
     assert torch.allclose(f_opt, target, rtol=1e-10)
+
+
+def test_contractions_deterministic_and_exact_multithreaded():
+    """Regression: torch 2.8 CPU batched complex128 matmul with a 1-row left operand
+    returns wrong values nondeterministically when multithreaded. The fp_core
+    contractions must not route through it."""
+    cfg = dataclasses.replace(Config(), M=180, K=60)
+    chb, theta0 = generate_channels(cfg, 2, seed=11, M=180, K=60)
+    chb = chb.to("cpu", C128)
+    phi = torch.exp(1j * theta0).to(C128)
+    p = chb.P.clone()
+    old = torch.get_num_threads()
+    torch.set_num_threads(max(old, 4))
+    try:
+        xc = chb.x.to(C128)
+        H_ref = chb.hd + (xc.unsqueeze(-1) * chb.b.conj() * phi.unsqueeze(2)).sum(-1).sum(1)
+        aux = fp.aux_vars(chb, p, phi)
+        c = torch.sqrt(aux.wt * p) * aux.eps - aux.Xi.unsqueeze(-1) * p * H_ref
+        g_ref = (xc * c.unsqueeze(1)).unsqueeze(-1).mul(chb.b).sum(2)
+        coef = torch.sqrt(aux.wt * p) * aux.eps - aux.Xi.unsqueeze(-1) * p * chb.hd
+        v_ref = (xc * coef.unsqueeze(1)).unsqueeze(-1).mul(chb.b).sum(2)
+        for _ in range(15):
+            assert _rel_close(fp.effective_channel(chb, phi), H_ref, 1e-12)
+            assert _rel_close(fp.grad_matrix_free(chb, p, phi, aux), g_ref, 1e-12)
+            assert _rel_close(fp.excitation_v(chb, p, aux), v_ref, 1e-12)
+    finally:
+        torch.set_num_threads(old)
