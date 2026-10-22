@@ -141,7 +141,7 @@ def write_synthetic(cfg, gpu=True, seed=0):
         files = sw._ds("sweep_M", Ms) + sw._ds("sweep_K", Ks) + ["datasets/test.pt"]
         o.update(timing_idx=np.arange(B), timing_n_samples=np.int64(B), timing_threads=np.int64(cfg.timing_threads),
                  device=np.array("cuda"), cdtype=np.array("complex64"), sweep_M=np.array(Ms), sweep_K=np.array(Ks),
-                 gpu_name=np.array("Synthetic GPU"),
+                 gpu_name=np.array("Synthetic GPU"), linalg_library=np.array(sw.GPU_LINALG),
                  **_meta(cfg, sw.TIME_KEYS + ("sweep_M", "sweep_K", "ao_tol", "ao_max_iter"), files))
         _save(cfg, "exp_supp_gpu_timing.npz", **o)
 
@@ -447,3 +447,66 @@ def test_text_suggestions_from_contradicted_claims(synth):
     sugg = md.split(report.SECTION_HEADINGS[-1], 1)[1]
     assert "cdf_p95_fonr" in sugg
     assert "Contradicted" in sugg
+
+
+# ---------------------------------------------------------------- final review M1 / M2 / I3
+def test_eta_claims_carry_direction_tag(tmp_path):
+    """|η − 100| claims say on which side of AO the worst point lies (a net BEATING AO is visible)."""
+    import report
+    cfg = _cfg(tmp_path)
+    claims = report.make_claims(cfg)
+    Ks, Ps, ZM = cfg.sweep_K, cfg.sweep_crn_dbm, report.zeroshot_points_of(cfg)
+    cases = {"K_indistinguishable_fonr": ("wsr_K", [f"eta_fonr_K{K}" for K in Ks]),
+             "pow_within_one_pp": ("power", [f"eta_ratio_of_means_{n}_P{P}" for n in NETS for P in Ps]),
+             "zsM_tias_tracks_ao": ("zeroshot_M", [f"eta_tias_M{M}_zeroshot" for M in ZM])}
+    for cid, (src, keys) in cases.items():
+        c = _claim(claims, cid)
+        for worst, tag in ((106.0, "method above AO"), (94.0, "method below AO")):
+            S = {src: {k: 100.2 for k in keys}}
+            S[src][keys[-1]] = worst
+            _, v, t = report.evaluate_claim(c, S)
+            assert v == report.CONTRADICTED and t == tag, (cid, worst, v, t)
+
+
+def _fake_teacher(cfg, p_star, P):
+    import teacher
+    ds = os.path.join(cfg.root, "datasets")
+    os.makedirs(ds, exist_ok=True)
+    torch.save({"config_hash": teacher._hash(cfg),
+                "splits": {"test": {"p_star": p_star, "p_ref1000": p_star.clone()}}},
+               os.path.join(ds, "teacher_labels.pt"))
+    torch.save({"ch": {"P": P}}, os.path.join(ds, "test.pt"))
+
+
+def test_single_active_user_observation(synth):
+    import report
+    P = torch.full((4, 3), 0.1, dtype=torch.float64)
+    p = torch.tensor([[0.1, 0.0, 0.0], [0.1, 0.05, 0.0], [0.1, 1e-20, 0.0], [0.1, 0.1, 0.1]], dtype=torch.float64)
+    _fake_teacher(synth, p, P)
+    o = report.ao_power_observation(synth)
+    assert o["n"] == 4
+    assert o["baseline"]["frac_one_active"] == pytest.approx(0.5)      # rows 0 and 2 (1e-20 < 1e-12·P)
+    assert o["baseline"]["frac_zero_power"] == pytest.approx(4 / 12)
+    md = report.build_report(synth).read_text(encoding="utf-8")
+    assert "single active user" in md and "absorbing" in md and "50" in md
+    assert "shared by all methods" in md
+
+
+def test_single_active_user_observation_missing(tmp_path):
+    import report
+    cfg = _cfg(tmp_path)
+    assert report.ao_power_observation(cfg) is None
+    md = report.build_report(cfg).read_text(encoding="utf-8")
+    assert "Teacher labels / test set: not run." in md
+
+
+def test_gpu_failure_pct_beside_every_gpu_ao_number(synth):
+    import report
+    md = report.build_report(synth).read_text(encoding="utf-8")
+    lat = md.split(report.SECTION_HEADINGS[5], 1)[1].split(report.SECTION_HEADINGS[6], 1)[0]
+    assert "% failed]" in lat and "BOTH AO modes" in lat
+    n_ao_cells = 2 * (len(synth.sweep_M) + len(synth.sweep_K)) + 4   # sweep tables + per-iter/conv rows
+    assert lat.count("% failed]") == n_ao_cells + 1                    # + the legend sentence
+    assert "FP-AO (explicit): runtime sweeps" in lat and "FP-AO (efficient): runtime sweeps" in lat
+    dev = md.split(report.SECTION_HEADINGS[3], 1)[1]
+    assert "EITHER AO mode" in dev and "magma" in dev

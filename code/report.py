@@ -140,6 +140,18 @@ def _tag_range(klo, khi, lo, hi):
     return f
 
 
+def _tag_eta(keys):
+    """Direction tag of a '|η − 100|' claim: the side of 100 % of the worst (largest |η − 100|) point, so a
+    Contradicted caused by a net BEATING the AO baseline is visible."""
+    def f(m):
+        vals = [float(m[k]) for k in keys]
+        if not vals or any(math.isnan(v) for v in vals):
+            return ""
+        v = max(vals, key=lambda x: abs(x - 100.0))
+        return "method above AO" if v > 100.0 else "method below AO" if v < 100.0 else "at AO"
+    return f
+
+
 def _v_time_within(k, x):
     """'reaches … within ≈ x ms': Confirmed if m ≤ 1.5x; Partly if m ≤ 3x; never reached (NaN) → Contradicted."""
     def f(m):
@@ -485,7 +497,7 @@ def make_claims(cfg: Config) -> list:
         return CONFIRMED if d <= 1.5 else PARTLY if d <= 3 else CONTRADICTED
     add(id="pow_within_one_pp", section="VI-D", figure="Fig. 5",
         text="all three nets track the benchmark's WSR to within about one percentage point at every power",
-        measured_key=ke, verdict_fn=onepp,
+        measured_key=ke, verdict_fn=onepp, tag_fn=_tag_eta(ke),
         tolerance="max |η − 100| over nets and powers: Confirmed if ≤ 1.5 pp ('about one'); Partly if ≤ 3 pp",
         suggestion="Sec. VI-D: replace 'within about one percentage point' by the measured worst-case deviation "
                    "from 100% ({m}).")
@@ -502,7 +514,7 @@ def make_claims(cfg: Config) -> list:
         kk = tuple(f"wsr_K:eta_{n}_K{K}" for K in Ks)
         add(id=f"K_indistinguishable_{n}", section="VI-E", figure="Fig. 6",
             text=f"{NET[n]} is visually indistinguishable from FP-AO across K = {min(Ks)}–{max(Ks)}, with no "
-                 "measurable degradation at the largest K", measured_key=kk,
+                 "measurable degradation at the largest K", measured_key=kk, tag_fn=_tag_eta(kk),
             verdict_fn=lambda m, kk=kk: (lambda d: CONFIRMED if d <= 1 else PARTLY if d <= 3 else CONTRADICTED)(
                 max(abs(float(m[k]) - 100) for k in kk)),
             tolerance="η_K = 100·mean R_net/mean R_AO; Confirmed if |η − 100| ≤ 1 at every K (≈ line width); "
@@ -576,6 +588,7 @@ def make_claims(cfg: Config) -> list:
     kk = tuple(f"zeroshot_M:eta_tias_M{M}_zeroshot" for M in ZM)
     add(id="zsM_tias_tracks_ao", section="VI-F", figure="Fig. 8",
         text="TIAS maintains near-optimal performance across the sweep, tracking FP-AO flawlessly", measured_key=kk,
+        tag_fn=_tag_eta(kk),
         verdict_fn=lambda m, kk=kk: (lambda d: CONFIRMED if d <= 1 else PARTLY if d <= 5 else CONTRADICTED)(
             max(abs(float(m[k]) - 100) for k in kk)),
         tolerance="|η − 100| at every M (training M included): Confirmed if ≤ 1 pp ('flawlessly'); Partly if ≤ 5 pp",
@@ -723,11 +736,47 @@ def final_summary(rows: list) -> dict:
     return s
 
 
+ACTIVE_REL = 1e-12   # a user is active if p > ACTIVE_REL · P_peak
+
+
+def ao_power_observation(cfg: Config) -> Optional[dict]:
+    """Power-allocation statistics of the teacher test labels (computed at report time).
+
+    None if ``datasets/teacher_labels.pt`` or ``datasets/test.pt`` is missing; ``{"stale": True}`` if the
+    labels do not match the config. Otherwise {"n": B, "baseline": stats, "ref1000": stats or None} with
+    stats = {"frac_one_active": share of samples with exactly one user with p > 1e-12·P,
+    "frac_zero_power": share of user powers exactly 0, "mean_active": mean number of active users}."""
+    import torch
+    import teacher
+    tp = os.path.join(cfg.root, "datasets", "teacher_labels.pt")
+    dp = os.path.join(cfg.root, "datasets", "test.pt")
+    if not (os.path.exists(tp) and os.path.exists(dp)):
+        return None
+    try:
+        t = teacher.load_teacher(cfg, "test")
+    except (RuntimeError, KeyError):
+        return {"stale": True}
+    P = torch.load(dp, weights_only=False)["ch"]["P"].double()
+
+    def stats(p):
+        p = p.double()
+        act = p > ACTIVE_REL * P
+        return {"frac_one_active": float((act.sum(-1) == 1).double().mean()),
+                "frac_zero_power": float((p == 0).double().mean()),
+                "mean_active": float(act.sum(-1).double().mean())}
+    return {"n": int(t["p_star"].shape[0]), "baseline": stats(t["p_star"]),
+            "ref1000": stats(t["p_ref1000"]) if "p_ref1000" in t else None}
+
+
 def load_artifacts(cfg: Config) -> dict:
     logs = os.path.join(cfg.root, "logs")
     p = lambda name: os.path.join(logs, name)  # noqa: E731
     art = {"sanity": None, "fonr_mu": None, "fonr_mu_note": "", "final_rows": [], "pilots": {},
-           "pilot_meta": {}, "histories": {}}
+           "pilot_meta": {}, "histories": {}, "ao_power": None}
+    try:
+        art["ao_power"] = ao_power_observation(cfg)
+    except Exception as e:  # noqa: BLE001 - never crash the report on a malformed artifact
+        art["ao_power"] = {"error": f"{type(e).__name__}: {e}"}
     if os.path.exists(p("sanity_check.json")):
         art["sanity"] = _read_json(p("sanity_check.json"))
     if os.path.exists(p("fonr_mu_init.json")):
@@ -932,16 +981,37 @@ def _ev_timing(ctx):
             "batch 1.")
 
 
+def _gpu_fail_pct(g: dict, m: str, key: str) -> Optional[float]:
+    """Failure % of GPU method ``m`` for a runtime point key (``M20``/``K10``) or ``conv`` / ``step``."""
+    if not g or not m.startswith("ao_"):
+        return None
+    if key in ("conv", "step"):
+        return g.get(f"ao_conv_pct_failed_{m[3:]}")
+    return g.get(f"runtime_pct_failed_{m}_{key}")
+
+
+def _gpu_fail_lines(g: dict) -> str:
+    """Per-AO-mode failure count and % (sweeps pooled; to convergence), zeros included."""
+    S = g.get("timing_n_samples")
+    parts = []
+    for mode in AO_MODES:
+        ks = [k for k in g if k.startswith(f"runtime_n_failed_ao_{mode}_")]
+        nf = sum(g[k] for k in ks)
+        tot = (S or 0) * len(ks)
+        sweep = f"{int(nf)}/{int(tot)} ({_fmt(100 * nf / tot)} %)" if tot else "n/a"
+        conv = g.get(f"ao_conv_n_failed_{mode}")
+        cp = g.get(f"ao_conv_pct_failed_{mode}")
+        conv_s = f"{int(conv)}/{int(S or 0)} ({_fmt(cp)} %)" if conv is not None else "n/a"
+        parts.append(f"FP-AO ({mode}): runtime sweeps {sweep}, default-setting run to convergence {conv_s}")
+    return "; ".join(parts)
+
+
 def _ev_gpu_fail(ctx):
     g = ctx["S"].get("gpu")
     if not g:
         return "GPU timing: not run."
-    fails = {k: v for k, v in g.items() if (k.startswith("runtime_n_failed_") or k.startswith("ao_conv_n_failed_"))
-             and v > 0}
-    if not fails:
-        return "No GPU sample failed."
-    return ("Failed (NaN, excluded from the GPU means): "
-            + "; ".join(f"{k} = {int(v)}" for k, v in sorted(fails.items())) + ".")
+    return ("Failed samples (NaN, excluded from the GPU means) per AO mode: " + _gpu_fail_lines(g) + ". "
+            "The nets never call eigvalsh.")
 
 
 def _ev_zs_fonr(ctx):
@@ -1111,8 +1181,10 @@ DEVIATIONS = [
               "The GTX 1660 Ti runs FP64 at ~1/32 speed; checkpoints are evaluated in complex128.",
               suggestion="Sec. VI-A: state training and evaluation precision."),
     Deviation("timing_subset", "Timing subset", "Sec. VI (timing protocol)", "VI",
-              "Spec §7.2 allows timing on a pre-declared subset (first 200 samples) only if timing all 10³ is too slow.",
-              "Same subset for every method; WSR always on all samples.",
+              "Spec §7.2 pre-declared subset: batch-1 timings use the first 200 test / sweep samples (notebook "
+              "default TIMING_SUBSET = 200), the same subset for every method; WSR values always use all 10³.",
+              "Timing all 10³ samples at every sweep point takes ~16 h (explicit AO at large M dominates); the cost "
+              "is more timing noise from fewer samples.",
               evidence_fn=_ev_timing_subset),
     Deviation("timing_method", "Timing method", "Sec. VI-B/C/E (not specified)", "VI",
               "CPU, complex128, batch 1, torch.no_grad, fixed thread count, warm-up discarded, time.perf_counter. "
@@ -1131,12 +1203,18 @@ DEVIATIONS = [
               "torch 2.8 CPU multithreaded batched complex matmul/einsum with a 1-row left operand returns wrong "
               "results (confirmed). Applied identically to all methods, so timing stays fair.",
               ""),
-    Deviation("gpu_eigvalsh", "GPU explicit-AO eigvalsh failures (supplementary timing)",
+    Deviation("gpu_eigvalsh", "GPU eigvalsh failures in both AO modes (supplementary timing)",
               "supplementary GPU timing (no paper text)", "VI",
-              "In GPU complex64 timing, a sample whose cuSOLVER eigvalsh raises LinAlgError (explicit AO, "
-              "ill-conditioned A_n) is stored as NaN and excluded from the means; counts are reported. CPU runs never "
-              "swallow the error.",
-              "complex64 eigen-decomposition of a rank-deficient M×M matrix can fail on cuSOLVER.",
+              "The GPU timing runs in complex64 with torch.backends.cuda.preferred_linalg_library('magma') (the "
+              "previous backend is restored afterwards). A sample whose eigvalsh raises LinAlgError in EITHER AO "
+              "mode (explicit: λ_max of the M×M A_n; efficient: λ_max of the K×K Gram matrix) is stored as NaN and "
+              "excluded from the GPU means; the failure count and percentage per AO mode are reported, and the "
+              "failure % is shown beside every GPU AO number in Sec. 4. CPU runs (complex128) never swallow the "
+              "error.",
+              "complex64 eigen-decomposition of rank-deficient / ill-conditioned Hermitian matrices can fail to "
+              "converge on the GPU. Build-time measurement (final review, default cuSOLVER backend): 34–77 % of "
+              "samples failed in both AO modes; MAGMA is used to reduce this. Residual failures bias the GPU AO "
+              "means toward the samples that succeeded.",
               evidence_fn=_ev_gpu_fail),
     Deviation("builder_calls", "Other builder's calls", "Sec. II / V / VI-A (not specified)", "VI",
               "User k even → CRN, odd → PMN (K = 6 gives 3 + 3 with exactly the listed weights); shadowing drawn "
@@ -1178,6 +1256,31 @@ def _section_inputs(cfg, S, status, art) -> list:
                 "(training config + AO rule).", "",
                 _table(["source", "cfg_hash", "ao_baseline_max_iter", "shared-config hash"], prow), ""]
         out += (flags or ["Consistency: all sources share the same training/AO configuration and AO cap."]) + [""]
+    return out
+
+
+def _section_ao_power(art, ao) -> list:
+    out = ["### Observation: AO solutions with a single active user (teacher test labels)", ""]
+    o = art.get("ao_power")
+    if o is None:
+        return out + ["Teacher labels / test set: not run.", ""]
+    if o.get("stale"):
+        return out + ["Teacher labels are stale for this config: not evaluated.", ""]
+    if o.get("error"):
+        return out + [f"Not evaluated ({o['error']}).", ""]
+    cols = [("baseline", ao)] + ([("ref1000", "AO-1000")] if o.get("ref1000") else [])
+    rows = [["% of test samples with exactly one active user (p > 1e-12·P)"]
+            + [_fmt(100 * o[c]["frac_one_active"]) for c, _ in cols],
+            ["% of user powers exactly 0"] + [_fmt(100 * o[c]["frac_zero_power"]) for c, _ in cols],
+            ["mean number of active users"] + [_fmt(o[c]["mean_active"]) for c, _ in cols]]
+    out += [f"Computed now from `datasets/teacher_labels.pt` (test split, {o['n']} samples).", "",
+            _table(["quantity"] + [lab for _, lab in cols], rows), "",
+            "Why: the FP power law p ← min{P, w̃ (max(0, Re{ε*H}))² / (|H|² Ξ)²} uses ε = √(w̃p)·H/D, so the new "
+            "power is proportional to the current one (multiplicative update). A user whose power reaches exactly "
+            "0 therefore stays at 0 in every later iteration: 0 is absorbing, and the iteration can settle on a "
+            "single-user (or few-user) allocation. The same deterministic power block is used by FP-AO and by "
+            "FONR, MASO and TIAS, so this behaviour is shared by all methods and is not an artefact of one of "
+            "them; it does, however, shape what 'the AO baseline' means in every efficiency number above.", ""]
     return out
 
 
@@ -1263,6 +1366,11 @@ def _section_metrics(art) -> list:
     return out
 
 
+def _fmt_gpu(v, pct) -> str:
+    """GPU cell: value plus the failure % for AO methods (always shown, also 0)."""
+    return _fmt(v) if pct is None else f"{_fmt(v)} [{_fmt(pct)} % failed]"
+
+
 def _ordering(vals: dict) -> str:
     ok = {k: v for k, v in vals.items() if v is not None and not math.isnan(v)}
     return " < ".join(METHOD_LABEL[k] for k in sorted(ok, key=ok.get))
@@ -1291,7 +1399,7 @@ def _section_latency(cfg, S) -> list:
                 c = _g(S, src, f"runtime_ms_{m}_{tag}{x}")
                 g = gpu.get(f"runtime_ms_{m}_{tag}{x}") if gpu else None
                 cpu_v[m], gpu_v[m] = c, g
-                row += [_fmt(c), _fmt(g)]
+                row += [_fmt(c), _fmt_gpu(g, _gpu_fail_pct(gpu, m, f"{tag}{x}"))]
             rows.append(row)
             if gpu and src in S:
                 a, b = _ordering(cpu_v), _ordering(gpu_v)
@@ -1309,20 +1417,19 @@ def _section_latency(cfg, S) -> list:
         c = None
         if conv and conv.get(f"ao_conv_iters_mean_{mode}"):
             c = conv[f"ao_conv_time_ms_{mode}"] / conv[f"ao_conv_iters_mean_{mode}"]
+        fp = _gpu_fail_pct(gpu, f"ao_{mode}", "conv")
         rows.append([f"FP-AO ({mode}) per iteration", _fmt(c),
-                     _fmt(gpu.get(f"step_time_ms_ao_{mode}") if gpu else None)])
+                     _fmt_gpu(gpu.get(f"step_time_ms_ao_{mode}") if gpu else None, fp)])
         rows.append([f"FP-AO ({mode}) to convergence", _fmt(conv.get(f"ao_conv_time_ms_{mode}") if conv else None),
-                     _fmt(gpu.get(f"ao_conv_time_ms_{mode}") if gpu else None)])
+                     _fmt_gpu(gpu.get(f"ao_conv_time_ms_{mode}") if gpu else None, fp)])
     out += [_table(["quantity (ms)", "CPU", "GPU"], rows), ""]
     if gpu:
         out += ["Method ordering on GPU vs CPU: " + ("unchanged at every point." if not changes else
                                                      "CHANGES at " + "; ".join(changes) + "."), ""]
-        fails = {k: v for k, v in gpu.items() if ("n_failed" in k) and v > 0}
-        if fails:
-            out += ["GPU samples that raised LinAlgError (cuSOLVER complex64 eigvalsh, explicit AO) and were excluded "
-                    "from the means: " + "; ".join(f"{k} = {int(v)}" for k, v in sorted(fails.items())) + ".", ""]
-        else:
-            out += ["No GPU sample raised LinAlgError.", ""]
+        out += ["GPU AO numbers carry '[x % failed]': the share of timed samples whose complex64 eigvalsh raised "
+                "LinAlgError (MAGMA backend). Failures can occur in BOTH AO modes (explicit: M×M A_n; efficient: "
+                "K×K Gram); failed samples are excluded from the GPU means, so a high % makes that GPU AO number "
+                "unreliable. Per mode: " + _gpu_fail_lines(gpu) + ".", ""]
     return out
 
 
@@ -1406,6 +1513,7 @@ def render_report(cfg: Config, S: dict, status: dict, art: dict) -> str:
     lines += _section_inputs(cfg, S, status, art)
     claims_md, results = _section_claims(cfg, S, ao)
     lines += claims_md
+    lines += _section_ao_power(art, ao)
     lines += _section_deviations(ctx)
     lines += _section_metrics(art)
     lines += _section_latency(cfg, S)

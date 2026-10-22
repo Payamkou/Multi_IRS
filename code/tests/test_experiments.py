@@ -381,3 +381,98 @@ def test_gpu_timing_runs(sweep_env):
         assert f"runtime_ms_{m}_K{sweep_env.sweep_K[0]}" in s
         assert f"step_time_ms_{m}" in s
     assert not any(f.startswith("gpu") for f in os.listdir(sweep_env.paper_dir))
+
+
+# ================================================================ per-point timing cache (final review I2/I3)
+def test_runtime_per_point_cache(sweep_env, monkeypatch):
+    """Each runtime point is its own npz; losing one point (and the combined file, as after an
+    interruption) recomputes only that point."""
+    from experiments import sweeps
+    p, s0 = sweeps.run_runtime_vs_K(sweep_env)
+    K0, K1 = sweep_env.sweep_K
+    pts = {K: sweeps.point_path(sweep_env, "exp_07_runtime_vs_K", f"K{K}") for K in (K0, K1)}
+    assert all(os.path.exists(q) for q in pts.values())
+    before = {K: os.path.getmtime(q) for K, q in pts.items()}
+    keep = np.load(p)[f"time_fonr_K{K0}"].copy()
+    os.remove(pts[K1])
+    os.remove(p)
+    time.sleep(0.05)
+    calls, real = [], sweeps._runtime_point
+    monkeypatch.setattr(sweeps, "_runtime_point", lambda cfg, split, x, *a, **k: (calls.append(x), real(cfg, split, x, *a, **k))[1])
+    p2, s2 = sweeps.run_runtime_vs_K(sweep_env)
+    assert calls == [K1]
+    assert os.path.getmtime(pts[K0]) == before[K0] and os.path.exists(pts[K1]) and os.path.exists(p2)
+    assert np.array_equal(np.load(p2)[f"time_fonr_K{K0}"], keep)
+    assert s2.keys() == s0.keys()
+    # a valid combined file is reused without touching any point
+    calls.clear()
+    sweeps.run_runtime_vs_K(sweep_env)
+    assert calls == []
+
+
+def test_runtime_vs_M_per_point_files(sweep_env):
+    from experiments import sweeps
+    sweeps.run_runtime_vs_M(sweep_env)
+    for M in sweep_env.sweep_M:
+        q = sweeps.point_path(sweep_env, "exp_04_runtime_vs_M", f"M{M}")
+        z = np.load(q)
+        assert int(z["point"]) == M and str(z["device"]) == "cpu" and str(z["cdtype"]) == "complex128"
+        assert all(f"time_{m}_M{M}" in z.files for m in ("ao_explicit", "ao_efficient", "fonr", "maso", "tias"))
+
+
+def test_gpu_summary_always_has_failure_counts_and_pct():
+    from experiments import sweeps
+    S, Ms, Ks = 4, (20,), (3,)
+    z = {"timing_threads": 2, "timing_n_samples": S}
+    for tag, x in (("M", 20), ("K", 3)):
+        for m in sweeps.TIME_METHODS:
+            z[f"time_{m}_{tag}{x}"] = np.full(S, 1e-3)
+    z["time_ao_explicit_M20"][0] = np.nan
+    for n in NETS:
+        z[f"step_time_{n}"] = np.full((S, 2), 1e-4)
+    for mode in sweeps.AO_MODES:
+        z[f"ao_cumtime_{mode}"] = np.full(S, 1e-2)
+        z[f"ao_steptime_{mode}"] = np.full(S, 1e-3)
+    z["ao_cumtime_efficient"][:] = np.nan          # every sample failed: NaN mean, no crash
+    z["ao_steptime_efficient"][:] = np.nan
+    s = sweeps.summarize_gpu(z, Ms, Ks)
+    for tag, x in (("M", 20), ("K", 3)):
+        for m in sweeps.TIME_METHODS:
+            assert f"runtime_n_failed_{m}_{tag}{x}" in s and f"runtime_pct_failed_{m}_{tag}{x}" in s
+    assert s["runtime_n_failed_ao_explicit_M20"] == 1 and s["runtime_pct_failed_ao_explicit_M20"] == 25.0
+    assert s["runtime_pct_failed_ao_efficient_K3"] == 0.0
+    assert s["ao_conv_n_failed_explicit"] == 0 and s["ao_conv_pct_failed_explicit"] == 0.0
+    assert s["ao_conv_pct_failed_efficient"] == 100.0 and np.isnan(s["ao_conv_time_ms_efficient"])
+    # CPU summaries keep their old key set (no failure keys when nothing failed)
+    assert not any("failed" in k for k in sweeps._summ_runtime(z, "K", Ks))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_gpu_timing_per_point_and_magma(sweep_env, monkeypatch):
+    from experiments import sweeps
+    prev = torch.backends.cuda.preferred_linalg_library()
+    seen, real = [], sweeps._runtime_point
+    monkeypatch.setattr(sweeps, "_runtime_point", lambda cfg, split, x, *a, **k: (
+        seen.append((x, str(torch.backends.cuda.preferred_linalg_library()))), real(cfg, split, x, *a, **k))[1])
+    p, s = sweeps.run_gpu_timing(sweep_env, force_rerun=True)
+    assert torch.backends.cuda.preferred_linalg_library() == prev          # restored
+    assert seen and all("Magma" in b for _, b in seen)
+    assert str(np.load(p)["linalg_library"]) == "magma"
+    labels = [f"M{x}" for x in sweep_env.sweep_M] + [f"K{x}" for x in sweep_env.sweep_K] + ["steps"]
+    q = {lab: sweeps.point_path(sweep_env, "exp_supp_gpu_timing", lab) for lab in labels}
+    assert all(os.path.exists(v) for v in q.values())
+    for mode in sweeps.AO_MODES:
+        assert f"ao_conv_pct_failed_{mode}" in s
+    import csv
+    with open(str(p)[:-4] + ".csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert {"n_failed", "pct_failed"} <= set(rows[0]) and any(r["experiment"] == "ao_to_convergence" for r in rows)
+    before = {lab: os.path.getmtime(v) for lab, v in q.items()}
+    lost = f"K{sweep_env.sweep_K[-1]}"
+    os.remove(q[lost])
+    os.remove(p)
+    time.sleep(0.05)
+    seen.clear()
+    sweeps.run_gpu_timing(sweep_env)
+    assert [x for x, _ in seen] == [sweep_env.sweep_K[-1]]
+    assert all(os.path.getmtime(q[lab]) == before[lab] for lab in labels if lab != lost)

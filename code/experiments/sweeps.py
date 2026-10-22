@@ -12,9 +12,16 @@ layer-L output, complex128, all samples. ``ao_baseline_max_iter`` (= cfg.ao_max_
 
 Timing experiments: batch 1, ``timing.time_steps`` with cfg.timing_warmup discarded runs; per-sample
 time = mean of the first cfg.L (=10) AO iterations / neural layers; samples = first
-cfg.timing_subset sweep samples (None -> all), the same subset for every method. AO is timed with
-``ao.AOStepper`` (explicit and efficient), never ``run_ao``. Paper runs: CPU, complex128,
-torch threads = cfg.timing_threads.
+cfg.timing_subset sweep samples (None -> all), the same subset for every method (spec §7.2; the notebook
+pre-declares 200). AO is timed with ``ao.AOStepper`` (explicit and efficient), never ``run_ao``. Paper
+runs: CPU, complex128, torch threads = cfg.timing_threads.
+
+Per-point cache (runtime sweeps exp_04/exp_07 and the GPU timing): every sweep point is written as soon as
+it is measured to ``results/points/{stem}_{label}.npz`` (label ``M<x>``, ``K<x>``; GPU also ``steps``)
+with its own cfg_hash (TIME_KEYS, without the sweep grid), artifact fingerprint (checkpoints, teacher
+labels, that point's dataset) and device/cdtype (+ linalg backend on GPU); a valid point is reused, so an
+interrupted run loses at most one point. The combined npz/csv below is assembled from the points and is
+what figures, summaries and report.py read (same ``cache_spec``/``summarize``).
 
 Result files (``{cfg.root}/results``; each with a per-(method, point) CSV of the same stem)
 -------------------------------------------------------------------------------------------
@@ -33,7 +40,7 @@ Result files (``{cfg.root}/results``; each with a per-(method, point) CSV of the
 * ``exp_supp_gpu_timing.npz``  (no figure) exp_04/exp_07 timings (keys as above) plus exp_01-style
   step timings on the default test split: ``step_time_{n}`` (S, L) s for the nets,
   ``ao_cumtime_{mode}`` (S,) s to convergence and ``ao_niter_{mode}`` (S,), ``ao_steptime_{mode}``
-  (S,) mean s/iteration; all methods on cuda, complex64.
+  (S,) mean s/iteration, ``linalg_library`` ("magma"); all methods on cuda, complex64.
 Every npz also carries ``cfg_json``, ``cfg_hash``, ``artifact_fingerprint`` (checkpoints, teacher
 labels and the sweep datasets used); a cache is reused only if all match (experiments.cache).
 Non-default ``device``/``cdtype`` runs of exp_04/exp_07 go to ``..._{device}_{cdtype}.npz``, no figure.
@@ -53,16 +60,18 @@ Methods m: ao_explicit, ao_efficient, fonr, maso, tias for timing; ao, fonr, mas
   ``timing_n_samples``
 * run_zeroshot_M:    ``wsr_{m}_M{M}_zeroshot`` (mean), ``eta_{n}_M{M}_zeroshot`` (%),
   ``M_reference``, ``ao_baseline_max_iter``
-* run_gpu_timing:    ``gpu_available`` (0/1); if 1 also ``runtime_ms_{m}_M{M}``, ``runtime_ms_{m}_K{K}``,
+* run_gpu_timing:    ``gpu_available``; if 1 also ``runtime_ms_{m}_M{M}``, ``runtime_ms_{m}_K{K}``,
   ``step_time_ms_{m}`` (mean per layer / per AO iteration), ``ao_conv_time_ms_{mode}``,
-  ``ao_conv_n_failed_{mode}``, ``timing_threads``, ``timing_n_samples``. Returns
-  ``(None, {"gpu_available": 0.0})`` without CUDA. GPU complex64 only: a sample whose cuSOLVER
-  eigvalsh raises LinAlgError (explicit AO, ill-conditioned A_n) is stored as NaN; means/medians
-  are NaN-aware and ``runtime_n_failed_{m}_{tag}{x}`` (present only when > 0) counts them.
-  CPU runs never swallow the error.
+  ``ao_conv_n_failed_{mode}``, ``ao_conv_pct_failed_{mode}``, ``runtime_n_failed_{m}_{tag}{x}`` and
+  ``runtime_pct_failed_{m}_{tag}{x}`` (always present, zeros included), ``timing_threads``,
+  ``timing_n_samples``. Returns ``(None, {"gpu_available": 0.0})`` without CUDA. GPU complex64 only, with
+  ``torch.backends.cuda.preferred_linalg_library("magma")`` during the timing (restored afterwards): a
+  sample whose eigvalsh raises LinAlgError (either AO mode: explicit M×M A_n or efficient K×K Gram) is
+  stored as NaN; means/medians are over the finite samples. CPU runs never swallow the error.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -78,7 +87,7 @@ import plotting
 import timing
 import train
 from config import Config, config_hash, seed_for
-from experiments.cache import artifact_fingerprint, check_cache, fingerprint_array
+from experiments.cache import artifact_fingerprint, check_cache, extend_fingerprint, fingerprint_array
 from experiments.convergence import (_atomic_npz, _ci95, _minor_label, _results_dir, _timing_idx, _wsr_per_layer,
                                      _write_csv, load_trained_models)
 from models.maso import MASO
@@ -144,28 +153,95 @@ def _fig(npz_fn, z, name, cfg):
     return out
 
 
+# ---------------------------------------------------------------- per-point cache (runtime sweeps, GPU timing)
+POINT_DIR = "points"
+GPU_LINALG = "magma"   # torch.backends.cuda.preferred_linalg_library during the supplementary GPU timing
+
+
+def point_path(cfg: Config, stem: str, label: str) -> str:
+    """``{root}/results/points/{stem}_{label}.npz``: one timing point (e.g. label ``M20``, ``K10``, ``steps``)."""
+    return os.path.join(cfg.root, "results", POINT_DIR, f"{stem}_{label}.npz")
+
+
+def _cached_points(cfg, stem, labels, keys, files_of, extra, compute, force) -> dict:
+    """{label: point dict}. A point is reused if its npz matches ``keys`` (cfg hash), the artifact
+    fingerprint (checkpoints, teacher labels and ``files_of(label)``) and ``extra``; otherwise
+    ``compute(label)`` runs and the point is written at once (atomic), so an interruption loses at most
+    the point being computed. ``force`` recomputes every point."""
+    os.makedirs(os.path.join(cfg.root, "results", POINT_DIR), exist_ok=True)
+    base = artifact_fingerprint(cfg)
+    out = {}
+    for lab in labels:
+        p = point_path(cfg, stem, lab)
+        fpr = extend_fingerprint(cfg, base, files_of(lab))
+        if force or not check_cache(p, cfg, keys, fpr, extra):
+            arrs = compute(lab)
+            arrs.update(_meta(cfg, keys, fpr), **{k: np.array(str(v)) for k, v in (extra or {}).items()})
+            _atomic_npz(p, **arrs)
+        out[lab] = _load(p)
+    return out
+
+
+class _Nets:
+    """Trained models loaded lazily (only when some point really has to be computed)."""
+
+    def __init__(self, cfg, device, cdtype):
+        self.cfg, self.device, self.cdtype, self._m, self._n = cfg, device, cdtype, None, None
+
+    @property
+    def models(self):
+        if self._m is None:
+            self._m = load_trained_models(self.cfg)
+        return self._m
+
+    @property
+    def on_device(self):
+        if self._n is None:
+            self._n = {n: _on(m, self.device, self.cdtype) for n, m in self.models.items()}
+        return self._n
+
+
+@contextlib.contextmanager
+def _linalg_library(name):
+    """Prefer the given CUDA linalg backend ("magma" / "cusolver") inside the block, then restore."""
+    prev = torch.backends.cuda.preferred_linalg_library()
+    torch.backends.cuda.preferred_linalg_library(name)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.preferred_linalg_library(prev)
+
+
 # ---------------------------------------------------------------- generic sweep bodies
-def _runtime_arrays(cfg, split, points, tag, device, cdtype, models) -> dict:
-    """time_{m}_{tag}{x} for every method and point (threads must already be set)."""
+def _runtime_point(cfg, split, x, tag, device, cdtype, nets: _Nets) -> dict:
+    """time_{m}_{tag}{x} for every method at one point (threads must already be set)."""
     idx = _timing_idx(cfg)
     out = {}
-    nets = {n: _on(m, device, cdtype) for n, m in models.items()}
-    scale = float(models["maso"].step_scale)
-    for x in points:
-        d = data.build_or_load(cfg, split, x)
-        for mode in AO_MODES:
-            out[f"time_ao_{mode}_{tag}{x}"] = _sample_times(ao.AOStepper(mode), d, idx, cfg, device, cdtype)
-        for n in NETS:
-            net = nets[n]
-            if tag == "M" and n == "maso":
-                net = _on(_untrained_maso(cfg, x, scale), device, cdtype)
-            out[f"time_{n}_{tag}{x}"] = _sample_times(net, d, idx, cfg, device, cdtype)
-        msg = ", ".join(f"{m} {1e3 * np.nanmean(out[f'time_{m}_{tag}{x}']):.4f}" for m in TIME_METHODS)
-        nf = {m: int(np.isnan(out[f"time_{m}_{tag}{x}"]).sum()) for m in TIME_METHODS}
-        if any(nf.values()):
-            print(f"[runtime {tag}={x}] WARNING samples failed (LinAlgError, recorded NaN): {nf}", flush=True)
-        print(f"[runtime {tag}={x} {device}/{_cname(cdtype)}] ms/iter: {msg}", flush=True)
+    d = data.build_or_load(cfg, split, x)
+    for mode in AO_MODES:
+        out[f"time_ao_{mode}_{tag}{x}"] = _sample_times(ao.AOStepper(mode), d, idx, cfg, device, cdtype)
+    for n in NETS:
+        net = nets.on_device[n]
+        if tag == "M" and n == "maso":
+            net = _on(_untrained_maso(cfg, x, float(nets.models["maso"].step_scale)), device, cdtype)
+        out[f"time_{n}_{tag}{x}"] = _sample_times(net, d, idx, cfg, device, cdtype)
+    msg = ", ".join(f"{m} {1e3 * np.nanmean(out[f'time_{m}_{tag}{x}']):.4f}" for m in TIME_METHODS)
+    nf = {m: int(np.isnan(out[f"time_{m}_{tag}{x}"]).sum()) for m in TIME_METHODS}
+    if any(nf.values()):
+        print(f"[runtime {tag}={x}] WARNING samples failed (LinAlgError, recorded NaN): {nf}", flush=True)
+    print(f"[runtime {tag}={x} {device}/{_cname(cdtype)}] ms/iter: {msg}", flush=True)
+    out.update(point=np.int64(x), timing_idx=idx, timing_n_samples=np.int64(len(idx)),
+               timing_threads=np.int64(torch.get_num_threads()))
     return out
+
+
+def _runtime_points(cfg, stem, split, points, tag, device, cdtype, extra, force, nets) -> dict:
+    """{time_*: (S,)} for every point of one runtime sweep, through the per-point cache."""
+    pts = _cached_points(cfg, stem, [f"{tag}{x}" for x in points], TIME_KEYS,
+                         lambda lab: _ds(split, [int(lab[len(tag):])]), extra,
+                         lambda lab: _runtime_point(cfg, split, int(lab[len(tag):]), tag, device, cdtype, nets),
+                         force)
+    return {k: v for d in pts.values() for k, v in d.items() if k.startswith("time_")}
 
 
 def _wsr_arrays(cfg, split, points, tag, models, chunk: int = 250) -> dict:
@@ -228,16 +304,25 @@ def _wsr_csv(path, z, tag, points, extra=None):
     _write_csv(path, list(rows[0]), rows)
 
 
-def _summ_runtime(z, tag, points) -> dict:
+def _summ_runtime(z, tag, points, failures: bool = False) -> dict:
+    """``failures=True`` (GPU): ``runtime_n_failed_*`` and ``runtime_pct_failed_*`` for every method and
+    point, zeros included. CPU runs never record a failure (the error is raised)."""
     s = {"timing_threads": float(z["timing_threads"]), "timing_n_samples": float(z["timing_n_samples"])}
     for x in points:
         for m in TIME_METHODS:
             t = z[f"time_{m}_{tag}{x}"]
-            s[f"runtime_ms_{m}_{tag}{x}"] = float(1e3 * np.nanmean(t))
-            s[f"runtime_median_ms_{m}_{tag}{x}"] = float(1e3 * np.nanmedian(t))
-            if np.isnan(t).any():  # GPU complex64 only (see _sample_times)
+            s[f"runtime_ms_{m}_{tag}{x}"] = _nanstat(np.nanmean, t)
+            s[f"runtime_median_ms_{m}_{tag}{x}"] = _nanstat(np.nanmedian, t)
+            if failures or np.isnan(t).any():
                 s[f"runtime_n_failed_{m}_{tag}{x}"] = float(np.isnan(t).sum())
+                s[f"runtime_pct_failed_{m}_{tag}{x}"] = float(100 * np.isnan(t).mean())
     return s
+
+
+def _nanstat(fn, t) -> float:
+    """1e3 * fn(t) in ms over the finite samples; NaN (no warning) if every sample failed."""
+    t = np.asarray(t, dtype=float)
+    return float(1e3 * fn(t)) if np.isfinite(t).any() else float("nan")
 
 
 def _summ_wsr(z, tag, points, suffix="", eta_prefix="eta_") -> dict:
@@ -276,7 +361,7 @@ def cache_spec(cfg: Config, exp: str, device: str = "cpu", cdtype=C128) -> tuple
     res = os.path.join(cfg.root, "results")
     if exp == GPU_EXP:
         files = _ds("sweep_M", cfg.sweep_M) + _ds("sweep_K", cfg.sweep_K) + ["datasets/test.pt"]
-        return os.path.join(res, "exp_supp_gpu_timing.npz"), GPU_KEYS, files, None
+        return os.path.join(res, "exp_supp_gpu_timing.npz"), GPU_KEYS, files, {"linalg_library": GPU_LINALG}
     stem, split, pts, _, sweep_key = EXPERIMENTS[exp]
     files = _ds(split, pts(cfg))
     if exp.startswith("runtime_"):
@@ -308,13 +393,15 @@ def summarize_power(z, pts) -> dict:
 def summarize_gpu(z, Ms, Ks) -> dict:
     """Summary of the supplementary GPU timing (keys in the module docstring)."""
     s = {"gpu_available": 1.0}
-    s.update(_summ_runtime(z, "M", Ms))
-    s.update(_summ_runtime(z, "K", Ks))
+    s.update(_summ_runtime(z, "M", Ms, failures=True))
+    s.update(_summ_runtime(z, "K", Ks, failures=True))
     for m in TIME_METHODS:
-        s[f"step_time_ms_{m}"] = float(1e3 * np.nanmean(_step_times(z, m)))
+        s[f"step_time_ms_{m}"] = _nanstat(np.nanmean, _step_times(z, m))
     for mode in AO_MODES:
-        s[f"ao_conv_time_ms_{mode}"] = float(1e3 * np.nanmean(z[f"ao_cumtime_{mode}"]))
-        s[f"ao_conv_n_failed_{mode}"] = float(np.isnan(z[f"ao_cumtime_{mode}"]).sum())
+        c = z[f"ao_cumtime_{mode}"]
+        s[f"ao_conv_time_ms_{mode}"] = _nanstat(np.nanmean, c)
+        s[f"ao_conv_n_failed_{mode}"] = float(np.isnan(c).sum())
+        s[f"ao_conv_pct_failed_{mode}"] = float(100 * np.isnan(c).mean())
     return s
 
 
@@ -342,9 +429,11 @@ def _run_runtime(cfg, exp, device, cdtype, force_rerun, plot_fn, fig_name):
     points = pts_fn(cfg)
     _results_dir(cfg)
     path, keys, files, extra = cache_spec(cfg, exp, device, cdtype)
+    stem = Path(path).stem
     if force_rerun or not check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=files), extra):
-        models = load_trained_models(cfg)
-        out, threads = _with_threads(cfg, lambda: _runtime_arrays(cfg, split, points, tag, device, cdtype, models))
+        nets = _Nets(cfg, device, cdtype)
+        out, threads = _with_threads(cfg, lambda: _runtime_points(cfg, stem, split, points, tag, device, cdtype,
+                                                                  extra, force_rerun, nets))
         idx = _timing_idx(cfg)
         out.update(points=np.array(points), timing_idx=idx, timing_n_samples=np.int64(len(idx)),
                    timing_threads=np.int64(threads), device=np.array(str(device)), cdtype=np.array(_cname(cdtype)),
@@ -437,67 +526,101 @@ def run_zeroshot_M(cfg: Config, force_rerun: bool = False):
 
 
 # ---------------------------------------------------------------- supplementary GPU timing
+def _gpu_steps_point(cfg, device, cdtype, nets) -> dict:
+    """exp_01-style step timings on the default test split (nets per layer, AO until convergence)."""
+    idx = _timing_idx(cfg)
+    d = data.build_or_load(cfg, "test")
+    out = {}
+    for n in NETS:
+        net = nets.on_device[n]
+        out[f"step_time_{n}"] = np.stack([
+            timing.time_steps(net, d["ch"].slice([int(i)]), d["theta0"][[int(i)]], net.L, device, cdtype,
+                              warmup=cfg.timing_warmup) for i in idx])
+    for mode in AO_MODES:
+        st = ao.AOStepper(mode)
+        runs = []
+        for i in idx:
+            try:
+                runs.append(timing.time_until_converged(st, d["ch"].slice([int(i)]), d["theta0"][[int(i)]],
+                                                        cfg.ao_tol, cfg.ao_max_iter, device, cdtype)[0])
+            except torch.linalg.LinAlgError:  # complex64 eigvalsh failure -> NaN
+                runs.append(np.array([np.nan]))
+        out[f"ao_cumtime_{mode}"] = np.array([r.sum() for r in runs])
+        out[f"ao_niter_{mode}"] = np.array([len(r) if np.isfinite(r).all() else -1 for r in runs])
+        out[f"ao_steptime_{mode}"] = np.array([r.mean() for r in runs])
+        nf = int(np.isnan(out[f"ao_cumtime_{mode}"]).sum())
+        print(f"[gpu timing] AO {mode} to convergence: {nf}/{len(idx)} samples failed "
+              f"({100 * nf / max(len(idx), 1):.1f} %, LinAlgError -> NaN)", flush=True)
+    print("[gpu timing] exp_01 step timings done", flush=True)
+    return out
+
+
 def run_gpu_timing(cfg: Config, force_rerun: bool = False):
-    """exp_04/exp_07 timings and exp_01 step timings on cuda, complex64, for all methods. No figure."""
+    """exp_04/exp_07 timings and exp_01 step timings on cuda, complex64, for all methods, with
+    ``torch.backends.cuda.preferred_linalg_library(GPU_LINALG)`` (= "magma"; the previous backend is
+    restored afterwards). Cached per point (``results/points/exp_supp_gpu_timing_{M<x>,K<x>,steps}.npz``),
+    then combined into ``exp_supp_gpu_timing.npz`` / ``.csv``. No figure."""
     if not torch.cuda.is_available():
         print("[gpu timing] CUDA not available; skipping the supplementary GPU timing", flush=True)
         return None, {"gpu_available": 0.0}
     device, cdtype = "cuda", C64
     _results_dir(cfg)
-    path, keys, files, _ = cache_spec(cfg, GPU_EXP)
+    path, keys, files, extra = cache_spec(cfg, GPU_EXP)
+    stem = Path(path).stem
     Ms, Ks = tuple(cfg.sweep_M), tuple(cfg.sweep_K)
-    if force_rerun or not check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=files)):
-        models = load_trained_models(cfg)
+    labels = [f"M{x}" for x in Ms] + [f"K{x}" for x in Ks] + ["steps"]
+    if force_rerun or not check_cache(path, cfg, keys, artifact_fingerprint(cfg, extra=files), extra):
+        nets = _Nets(cfg, device, cdtype)
         idx = _timing_idx(cfg)
+        pextra = {"device": device, "cdtype": _cname(cdtype), **extra}
+
+        def files_of(lab):
+            if lab == "steps":
+                return ["datasets/test.pt"]
+            return _ds("sweep_M" if lab[0] == "M" else "sweep_K", [int(lab[1:])])
+
+        def compute(lab):
+            if lab == "steps":
+                return _gpu_steps_point(cfg, device, cdtype, nets)
+            tag, x = lab[0], int(lab[1:])
+            return _runtime_point(cfg, "sweep_M" if tag == "M" else "sweep_K", x, tag, device, cdtype, nets)
 
         def body():
-            out = _runtime_arrays(cfg, "sweep_M", Ms, "M", device, cdtype, models)
-            out.update(_runtime_arrays(cfg, "sweep_K", Ks, "K", device, cdtype, models))
-            d = data.build_or_load(cfg, "test")
-            for n, m in models.items():
-                net = _on(m, device, cdtype)
-                out[f"step_time_{n}"] = np.stack([
-                    timing.time_steps(net, d["ch"].slice([int(i)]), d["theta0"][[int(i)]], net.L, device, cdtype,
-                                      warmup=cfg.timing_warmup) for i in idx])
-            for mode in AO_MODES:
-                st = ao.AOStepper(mode)
-                runs = []
-                for i in idx:
-                    try:
-                        runs.append(timing.time_until_converged(st, d["ch"].slice([int(i)]), d["theta0"][[int(i)]],
-                                                                cfg.ao_tol, cfg.ao_max_iter, device, cdtype)[0])
-                    except torch.linalg.LinAlgError:  # cuSOLVER complex64 eigvalsh failure -> NaN
-                        runs.append(np.array([np.nan]))
-                out[f"ao_cumtime_{mode}"] = np.array([r.sum() for r in runs])
-                out[f"ao_niter_{mode}"] = np.array([len(r) if np.isfinite(r).all() else -1 for r in runs])
-                out[f"ao_steptime_{mode}"] = np.array([r.mean() for r in runs])
-                nf = int(np.isnan(out[f"ao_cumtime_{mode}"]).sum())
-                if nf:
-                    print(f"[gpu timing] WARNING AO {mode}: {nf} samples failed (LinAlgError, NaN)", flush=True)
-            print("[gpu timing] exp_01 step timings done", flush=True)
-            return out
+            with _linalg_library(GPU_LINALG):
+                pts = _cached_points(cfg, stem, labels, TIME_KEYS, files_of, pextra, compute, force_rerun)
+            return {k: v for d in pts.values() for k, v in d.items()
+                    if k.startswith(("time_", "step_time_", "ao_cumtime_", "ao_niter_", "ao_steptime_"))}
 
         out, threads = _with_threads(cfg, body)
         out.update(timing_idx=idx, timing_n_samples=np.int64(len(idx)), timing_threads=np.int64(threads),
                    device=np.array(device), cdtype=np.array(_cname(cdtype)), sweep_M=np.array(Ms),
                    sweep_K=np.array(Ks), gpu_name=np.array(torch.cuda.get_device_name(0)),
-                   **_meta(cfg, keys, artifact_fingerprint(cfg, extra=files)))
+                   linalg_library=np.array(GPU_LINALG), **_meta(cfg, keys, artifact_fingerprint(cfg, extra=files)))
         _atomic_npz(path, **out)
-        rows = []
-        for tag, pts in (("M", Ms), ("K", Ks)):
-            for x in pts:
-                for m in TIME_METHODS:
-                    t = out[f"time_{m}_{tag}{x}"]
-                    rows.append({"experiment": f"runtime_vs_{tag}", "method": m, "point": int(x),
-                                 "mean_ms": 1e3 * np.nanmean(t), "median_ms": 1e3 * np.nanmedian(t),
-                                 "n_failed": int(np.isnan(t).sum())})
-        for m in TIME_METHODS:
-            t = _step_times(out, m)
-            rows.append({"experiment": "step_time", "method": m, "point": "",
-                         "mean_ms": 1e3 * np.nanmean(t), "median_ms": 1e3 * np.nanmedian(t),
-                         "n_failed": int(np.isnan(t).sum())})
-        _write_csv(path[:-4] + ".csv", ["experiment", "method", "point", "mean_ms", "median_ms", "n_failed"], rows)
+        _gpu_csv(path[:-4] + ".csv", out, Ms, Ks)
+        s = summarize(cfg, GPU_EXP, out)
+        n_sweep = len(idx) * (len(Ms) + len(Ks))
+        print("[gpu timing] failures per AO mode: " + "; ".join(
+            f"{mode}: to convergence {int(s[f'ao_conv_n_failed_{mode}'])}/{len(idx)} "
+            f"({s[f'ao_conv_pct_failed_{mode}']:.1f} %), sweeps "
+            f"{int(sum(s[f'runtime_n_failed_ao_{mode}_{t}{x}'] for t, P in (('M', Ms), ('K', Ks)) for x in P))}"
+            f"/{n_sweep}" for mode in AO_MODES), flush=True)
     return Path(path), summarize(cfg, GPU_EXP, _load(path))
+
+
+def _gpu_csv(path, out, Ms, Ks):
+    """One row per (experiment, method, point): mean/median ms over the finite samples, n_samples (finite),
+    n_failed and pct_failed (always present, zeros included)."""
+    def row(exp, m, pt, t):
+        t = np.asarray(t, dtype=float)
+        return {"experiment": exp, "method": m, "point": pt, "mean_ms": _nanstat(np.nanmean, t),
+                "median_ms": _nanstat(np.nanmedian, t), "n_samples": int(np.isfinite(t).sum()),
+                "n_failed": int(np.isnan(t).sum()), "pct_failed": float(100 * np.isnan(t).mean())}
+    rows = [row(f"runtime_vs_{tag}", m, int(x), out[f"time_{m}_{tag}{x}"])
+            for tag, pts in (("M", Ms), ("K", Ks)) for x in pts for m in TIME_METHODS]
+    rows += [row("step_time", m, "", _step_times(out, m)) for m in TIME_METHODS]
+    rows += [row("ao_to_convergence", f"ao_{mode}", "", out[f"ao_cumtime_{mode}"]) for mode in AO_MODES]
+    _write_csv(path, list(rows[0]), rows)
 
 
 def _step_times(z, m) -> np.ndarray:

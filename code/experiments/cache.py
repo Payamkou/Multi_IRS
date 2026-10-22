@@ -40,6 +40,13 @@ def artifact_fingerprint(cfg, nets=NETS, extra=()) -> dict:
     return {r: _entry(os.path.join(cfg.root, r)) for r in rels}
 
 
+def extend_fingerprint(cfg, base: dict, extra=()) -> dict:
+    """``base`` (an ``artifact_fingerprint``) plus the entries of ``extra`` files; equal to
+    ``artifact_fingerprint(cfg, extra=extra)`` when ``base`` used the default nets, but hashes the
+    checkpoints / teacher labels only once when many per-point fingerprints are needed."""
+    return {**base, **{r: _entry(os.path.join(cfg.root, r)) for r in extra}}
+
+
 def fingerprint_array(fp: dict) -> np.ndarray:
     return np.array(json.dumps(fp, sort_keys=True))
 
